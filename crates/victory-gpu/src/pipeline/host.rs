@@ -1396,9 +1396,10 @@ mod tests {
         b
     }
 
-    /// The runtime's refusal reads as #168's log does, and the directly
-    /// indexed heaps serialize exactly when the device reports shader model
-    /// 6.6 (Windows 10's in-box runtime: neither).
+    /// The runtime's refusal reads as #168's log does. A device that reports
+    /// shader model 6.6 comes from a runtime that knows 6.6, so that runtime
+    /// serializes the directly indexed heaps. The converse does not hold: the
+    /// runtime knows the flags whatever the card supports.
     #[test]
     fn the_runtime_refuses_flags_it_does_not_know() {
         let unknown = D3D12_ROOT_SIGNATURE_FLAGS(0x80_0000);
@@ -1428,12 +1429,9 @@ mod tests {
         .is_ok()
             && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
         let flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | DIRECTLY_INDEXED;
-        assert_eq!(
-            runtime_refuses(flags).is_none(),
-            sm66,
-            "{:?}",
-            runtime_refuses(flags)
-        );
+        if sm66 {
+            assert_eq!(runtime_refuses(flags), None);
+        }
         if sm66 {
             assert!(root_signature(&host.device, &[], &[], false).is_ok());
             assert!(root_signature(&host.device, &[], &[], true).is_ok());
