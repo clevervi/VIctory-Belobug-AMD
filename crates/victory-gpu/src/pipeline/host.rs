@@ -1134,6 +1134,50 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The heaps translated shaders index directly (shader model 6.6): every
+/// host pipeline's root signature carries both flags.
+pub(crate) const DIRECTLY_INDEXED: D3D12_ROOT_SIGNATURE_FLAGS = D3D12_ROOT_SIGNATURE_FLAGS(
+    D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0,
+);
+
+/// The text of a D3D blob (the serializer's reason for a refusal).
+pub(crate) fn blob_text(blob: &ID3DBlob) -> String {
+    // SAFETY: the blob's own buffer, read before the blob is released.
+    let text = unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    };
+    String::from_utf8_lossy(text)
+        .trim_end_matches(['\0', '\n'])
+        .to_owned()
+}
+
+/// Why the D3D12 runtime in use refuses to serialize an empty root
+/// signature with `flags`; `None` if it serializes it. It is the runtime
+/// (`d3d12.dll`, or the Agility SDK's `D3D12Core.dll`), not the card or its
+/// driver, that knows the flags: Windows 10's in-box runtime stops at shader
+/// model 6.5 and refuses the directly indexed heap flags with "Unsupported
+/// bit-flag set", so every host pipeline is refused there.
+pub(crate) fn runtime_refuses(flags: D3D12_ROOT_SIGNATURE_FLAGS) -> Option<String> {
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                Flags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: an empty description; both blobs are owned here.
+    let made = unsafe { D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) };
+    match made {
+        Ok(()) => None,
+        Err(e) => Some(error.as_ref().map_or_else(|| e.to_string(), blob_text)),
+    }
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1153,9 +1197,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: input | DIRECTLY_INDEXED,
             },
         },
     };
@@ -1166,11 +1208,7 @@ fn root_signature(
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
             if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                tracing::warn!("root signature: {}", blob_text(&error));
             }
             return Err(e);
         }
@@ -1356,6 +1394,50 @@ mod tests {
             t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
         }
         b
+    }
+
+    /// The runtime's refusal reads as #168's log does, and the directly
+    /// indexed heaps serialize exactly when the device reports shader model
+    /// 6.6 (Windows 10's in-box runtime: neither).
+    #[test]
+    fn the_runtime_refuses_flags_it_does_not_know() {
+        let unknown = D3D12_ROOT_SIGNATURE_FLAGS(0x80_0000);
+        let why = runtime_refuses(unknown).expect("an unknown flag serialized");
+        assert_eq!(
+            why,
+            "Unsupported bit-flag set (root signature flags 800000)."
+        );
+        assert_eq!(
+            runtime_refuses(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT),
+            None
+        );
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: the query writes the structure of the given size.
+        let sm66 = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+        }
+        .is_ok()
+            && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+        let flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | DIRECTLY_INDEXED;
+        assert_eq!(
+            runtime_refuses(flags).is_none(),
+            sm66,
+            "{:?}",
+            runtime_refuses(flags)
+        );
+        if sm66 {
+            assert!(root_signature(&host.device, &[], &[], false).is_ok());
+            assert!(root_signature(&host.device, &[], &[], true).is_ok());
+        }
     }
 
     #[test]
