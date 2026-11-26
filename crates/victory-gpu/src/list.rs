@@ -1874,6 +1874,7 @@ fn count_draw() {
 static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// See [`TOTALS`].
+#[cfg(feature = "diagnostics")]
 pub(crate) fn totals() -> [u64; 3] {
     TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }

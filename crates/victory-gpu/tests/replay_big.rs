@@ -20,7 +20,7 @@ use windows::core::Interface;
 
 const SUBMITS: usize = 30;
 const CALLS: usize = 40_000;
-const VIEWS: u32 = 1_500_000;
+const VIEWS: u32 = 1_000_000;
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
 fn buffer(device: &ID3D12Device, kind: u32, size: u64) -> (ID3D12Resource, *mut u8) {

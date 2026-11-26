@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -87,7 +88,15 @@ impl Pending {
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
                 let began = Instant::now();
-                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                let made = match catch_unwind(AssertUnwindSafe(|| {
+                    HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                })) {
+                    Ok(pipeline) => pipeline,
+                    Err(_) => {
+                        tracing::warn!(key = self.key, shaders = ?self.shaders, "host pipeline build panicked");
+                        None
+                    }
+                };
                 super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
                 made
             };

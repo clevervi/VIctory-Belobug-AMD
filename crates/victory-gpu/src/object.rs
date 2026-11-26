@@ -71,6 +71,15 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Takes a reference to `this` if it still has one; `false` if it has none
+/// left (its last one is already being released).
+#[cfg(windows)]
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1)).is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
