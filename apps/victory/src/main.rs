@@ -273,16 +273,25 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
-    for p in cfg
-        .game_dir
-        .iter()
-        .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir, &cfg.data_dir])
-    {
+    check_policy(
+        cfg.game_dir
+            .iter()
+            .chain(&cfg.test_titles)
+            .chain([&cfg.cache_dir, &cfg.data_dir]),
+    )
+}
+
+/// Each path that breaks the repository rule, on stderr; an error (so a
+/// non-zero exit) when there is one, as the commands that use them stop.
+fn check_policy<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    let mut violations = 0;
+    for p in paths {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
-            println!("POLICY VIOLATION: {e}");
+            eprintln!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(violations == 0, "{violations} policy violation(s)");
     Ok(())
 }
 
@@ -298,4 +307,19 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_check_fails_on_a_path_inside_the_repo() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().to_path_buf();
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache");
+        assert!(check_policy([&outside]).is_ok());
+        let err = check_policy([&outside, &inside, &inside]).unwrap_err();
+        assert_eq!(err.to_string(), "2 policy violation(s)");
+    }
 }
