@@ -346,16 +346,25 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 (graphics) and 0x218 (compute), `SLOT`: the title's
+/// cache of pipelines from its precompiled console binaries, called as
+/// `(this, description, interface id, out)` for `ID3D12PipelineState`. The
+/// description is the title's root signature, then code and metadata per
+/// stage. They fail on purpose, with `out` null: every failure has a
+/// fallback that makes the same pipeline from its ordinary description,
+/// which we translate (checked in the 1.0.2.1 executable):
+/// - 0x1c8: a loading job (title+0x24774c0) calls it once per cache entry
+///   and keeps only the successes in a map; the pipeline builder
+///   (title+0x2479760) looks there (title+0x2479f40) and on a miss calls
+///   0x2b0, `create_stream`.
+/// - 0x218: title+0x247fd30 calls it through title+0x2480050 and on null
+///   calls 0x1f0, `create_compute_x`.
+///
+/// Answering them makes things worse: native-only pipelines that do not
+/// translate replace ones that do (upstream VIctory pull request #3163:
+/// dropped draws 82 to 1,440 a frame), and `S_OK` without an object
+/// crashes the title (#518). The first calls log the description's words
+/// at debug level, for diagnostics.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -388,12 +397,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+        tracing::debug!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a precompiled pipeline refused on purpose: the title makes it from its ordinary description"
         );
     }
     E_NOTIMPL
@@ -500,6 +509,20 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    /// The precompiled pipeline cache (0x1c8, 0x218) fails with no object:
+    /// the title then makes the pipeline the ordinary way, and an `S_OK`
+    /// or a stale `out` would hand it whatever its stack held.
+    #[test]
+    fn precompiled_pipelines_fail_with_no_object() {
+        let (_, device) = create_as(&IID);
+        for at in [0x1c8, 0x218] {
+            let method = slot::<extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT>(device, at);
+            let mut out: This = std::ptr::dangling();
+            assert_eq!(method(device, std::ptr::null(), &IID, &mut out), E_NOTIMPL);
+            assert!(out.is_null(), "slot {at:#x} left out set");
+        }
     }
 
     #[test]
