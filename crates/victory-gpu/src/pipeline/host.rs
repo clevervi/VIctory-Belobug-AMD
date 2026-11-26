@@ -1396,7 +1396,7 @@ mod tests {
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
-        return float4(p * 2.0 - 1.0, 0.5, 1.0);
+        return float4(p * 2.0 - 1.0, 0.75, 1.0);
     }";
 
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
@@ -1421,14 +1421,15 @@ mod tests {
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
 
         let mut g = GraphicsState::default();
-        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // WARP can ignore depth bounds with DepthEnable off even when it
+        // reports support. ALWAYS with writes off leaves bounds as the
+        // only test that can reject the draw.
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),
@@ -1467,19 +1468,18 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the depth-bounds pipeline was compiled again instead of loaded from the library"
         );
 
-        // Execute two draws against a depth buffer cleared to 0.5:
-        // 1) bounds [0.6, 1.0] -> rejected (target stays 0)
-        // 2) bounds [0.4, 0.6] replayed onto a fresh HostList -> passes (target becomes 255)
+        // The depth bounds test reads the stored 0.5, distinct from the
+        // incoming vertex depth of 0.75.
         let make_tex = |format, flags, state, clear: D3D12_CLEAR_VALUE| {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -1566,6 +1566,11 @@ mod tests {
             out.unwrap()
         };
 
+        // The directly indexed root signature requires both heaps.
+        let heaps = [
+            Some(host.fallback_view_heap().expect("CBV/SRV/UAV heap").clone()),
+            Some(host.fallback_sampler_heap().expect("sampler heap").clone()),
+        ];
         let run_draw = |min: f32, max: f32| -> u8 {
             let mut state = crate::draw::State::default();
             let first_list = host.new_list().unwrap();
@@ -1597,6 +1602,7 @@ mod tests {
                 list.list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
+                list.list.SetDescriptorHeaps(&heaps);
                 list.list.SetGraphicsRootSignature(&root);
                 list.list.SetPipelineState(&pso);
                 list.list
@@ -1648,6 +1654,7 @@ mod tests {
         };
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
+        assert_eq!(run_draw(0.0, 0.4), 0, "depth 0.5 outside [0.0, 0.4] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }
 
