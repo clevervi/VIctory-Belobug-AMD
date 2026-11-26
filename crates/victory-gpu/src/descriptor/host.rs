@@ -13,6 +13,11 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Each host heap's identity, handed out in order: a range of dynamic slots
+/// is given back to the heap that took it, and a heap made later at the same
+/// address is not that heap ([`HostHeap::release`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -232,6 +237,8 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release`]).
+    id: u64,
 }
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
@@ -1730,6 +1737,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -1919,6 +1927,12 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back only
+    /// to it, never to a heap made later at the same address.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -2774,10 +2788,16 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if they were taken by this heap: `id` is [`HostHeap::id`]'s.
+    /// The title can release the heap a list's slots came from, and a later
+    /// heap can be made at the same address; the list's reset then names the
+    /// old heap, and must not free the new one's slots ([`NEXT_ID`]).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -6123,7 +6143,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
@@ -6141,18 +6161,40 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A range of dynamic slots is given back only to the heap that took it:
+    /// the title can release a heap while a list still holds slots of it,
+    /// and a later heap can be made at the same address before that list is
+    /// reset (fxceless #1324).
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free, "another heap's identity gave the range back");
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free + 2, "their own heap did not get the range back");
     }
 }
 
