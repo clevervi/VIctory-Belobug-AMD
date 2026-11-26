@@ -217,8 +217,8 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             let wave = translate::host_wave::select(
-                std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
-                std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
+                std::env::var_os("VICTORY_HOST_WAVE").as_deref(),
+                std::env::var_os("VICTORY_HOST_MAX_WAVE").as_deref(),
                 |message| eprintln!("{message}"),
             );
             if let Some(file) = warm {
