@@ -630,6 +630,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    dump_refused(&name, &code_bytes(&code(0)), &root_blob);
                     return None;
                 }
             };
@@ -1011,6 +1012,25 @@ fn mesh_pipeline(
 }
 
 /// The bytes of shader code (none for an absent stage).
+/// `VICTORY_REFUSED_DUMP=<dir>` (diagnostics; off unless set): a compute
+/// pipeline the host refuses leaves its DXIL (`<name>.dxil`, for
+/// `dxc -dumpbin`) and root signature (`<name>.root`) there, for when the
+/// debug layer is not installed to say why. Outside the repository only.
+fn dump_refused(name: &str, dxil: &[u8], root: &[u8]) {
+    let Some(dir) = std::env::var_os("VICTORY_REFUSED_DUMP").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let written = (|| -> Result<(), String> {
+        victory_core::ensure_outside_repo(&dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("{name}.dxil")), dxil).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("{name}.root")), root).map_err(|e| e.to_string())
+    })();
+    if let Err(e) = written {
+        tracing::warn!(error = %e, dir = %dir.display(), "refused pipeline not dumped");
+    }
+}
+
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();
