@@ -1112,8 +1112,8 @@ fn create() -> windows::core::Result<Host> {
             tracing::error!(
                 %why,
                 "the D3D12 runtime refuses directly indexed descriptor heaps (shader model 6.6), \
-                 so every host pipeline will be refused; Windows 10's in-box runtime does this \
-                 and needs the D3D12 Agility SDK runtime beside victory.exe"
+                 so every host pipeline will be refused; Windows 10's in-box runtime does this, \
+                 and only a newer D3D12 runtime (the Agility SDK) takes them"
             );
         }
         Ok(Host {
