@@ -499,6 +499,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -655,6 +656,43 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], co
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(color, 1), bytes_of(rects, count as usize)],
     );
 }
+/// `ClearUnorderedAccessViewUint` / `...Float` written down: the view's
+/// record as it is now (the slot may be written again before the list is
+/// made), the values and the rectangles.
+fn clear_uav(this: This, cpu: u64, values: *const [u32; 4], float: bool, count: u32, rects: *const Rect) {
+    if cpu == 0 || values.is_null() {
+        return;
+    }
+    let count = if rects.is_null() { 0 } else { count };
+    let view = record(cpu);
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count), u64::from(float)],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(values, 1), bytes_of(rects, count as usize)],
+    );
+}
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, cpu, values, false, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, cpu, values, true, count, rects);
+}
 extern "system" fn clear_dsv(
     this: This,
     handle: u64,
@@ -796,6 +834,18 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV => {
+                let clear = if w[1] != 0 { state::clear_unordered_float } else { state::clear_unordered_uint };
+                clear(
+                    list,
+                    0,
+                    w[2..].as_ptr() as u64,
+                    std::ptr::null(),
+                    at_or(w, 2 + RECORD),
+                    n as u32,
+                    at(w, 2 + RECORD + 2, n),
+                );
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -832,7 +882,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -868,6 +918,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
@@ -893,7 +945,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 17] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 55, 73, 99, 124];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");

@@ -4416,6 +4416,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     make_twinned(view, at, None)
 }
 
+/// [`make`] for a slot outside our heaps (an unordered access clear's CPU
+/// handle): the resource the view is of, if the host could make it.
+pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    make(view, at).flatten()
+}
+
 /// [`make`]; `twin`: where the raw twin of a buffer view goes
 /// ([`raw_twins`]; a constant buffer's is the same view again, other views
 /// have none).
