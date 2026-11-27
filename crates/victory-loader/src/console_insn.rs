@@ -109,9 +109,39 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
     Some(code)
 }
 
-/// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
-static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+/// Room for native replacement stubs (`clzero_stub`, `extrq_imm_stub`,
+/// `insertq_imm_stub`) near title code: each entry is `(base, used)`. Keeping
+/// a list lets images or pages more than 2 GiB apart each get a reachable
+/// stub block.
+static STUBS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 pub(crate) const STUBS_LEN: usize = 64 << 10;
+
+/// Reserves space for a stub reachable by `jmp rel32` from `at`, writes the
+/// stub built by `build(stub_addr)`, and returns `(stub_addr, jmp_bytes)`.
+fn emit_stub(at: usize, build: impl FnOnce(usize) -> Option<Vec<u8>>) -> Option<[u8; 5]> {
+    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = stubs
+        .iter()
+        .position(|&(place, used)| used + 128 <= STUBS_LEN && jump(at, place + used).is_some())
+        .or_else(|| {
+            let place = near(at)?;
+            stubs.push((place, 0));
+            Some(stubs.len() - 1)
+        })?;
+    let (place, used) = &mut stubs[slot];
+    let stub = *place + *used;
+    let body = build(stub)?;
+    let jmp = jump(at, stub)?;
+    if *used + body.len() > STUBS_LEN {
+        return None;
+    }
+    // SAFETY: inside our RWX stub block not yet jumped to.
+    unsafe {
+        std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
+    }
+    *used += body.len().next_multiple_of(16);
+    Some(jmp)
+}
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
 pub(crate) fn near(at: usize) -> Option<usize> {
@@ -135,26 +165,136 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
-    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
-    if stubs.is_none() {
-        *stubs = near(at).map(|place| (place, 0));
+    if (at & 15) + 5 > 16 {
+        return false;
     }
-    let Some((place, used)) = stubs.as_mut() else {
+    let Some(jmp) = emit_stub(at, |stub| clzero_stub(at, stub, [x, y, z])) else {
         return false;
     };
-    let stub = *place + *used;
-    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
+    // SAFETY: title code, patched atomically after the stub is in place.
+    unsafe { patch(at, [a, b, c, d, e], jmp) }
+}
+
+/// Whether immediate SSE4a `extrq` / `insertq` instructions are replaced on
+/// their first fault by a jump to a native stub (`extrq_imm_stub` /
+/// `insertq_imm_stub`), eliminating thousands of Windows VEH `#UD` exceptions
+/// per second on Intel CPUs (AMD CPUs execute SSE4a natively and never fault).
+/// On by default; `VICTORY_PATCH_SSE4A=0` emulates each time.
+fn patches_sse4a() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_SSE4A").is_none_or(|v| v != "0"))
+}
+
+/// `movq gpr, xmm` (`to_xmm=false`) or `movq xmm, gpr` (`to_xmm=true`, zeros
+/// upper 64 bits of `xmm`), for `gpr` in `0..16` and `xmm` in `0..16`.
+fn movq_xmm_gpr(xmm: u8, gpr: u8, to_xmm: bool) -> [u8; 5] {
+    let rex = 0x48 | ((xmm >> 3) << 2) | (gpr >> 3);
+    let opcode = if to_xmm { 0x6E } else { 0x7E };
+    let modrm = 0xC0 | ((xmm & 7) << 3) | (gpr & 7);
+    [0x66, rex, 0x0F, opcode, modrm]
+}
+
+/// Native stub for `extrq xmm_dst, imm_len, imm_idx` at `at` (length
+/// `insn_len`), placed at `stub`. Preserves all GPRs, EFLAGS, and other XMMs;
+/// zeros `xmm_dst.High`, matching the emulator.
+fn extrq_imm_stub(at: usize, insn_len: usize, stub: usize, dst: u8, imm_len: u8, imm_idx: u8) -> Option<Vec<u8>> {
+    let len = match imm_len & 63 {
+        0 => 64u32,
+        n => u32::from(n),
+    };
+    let idx = imm_idx & 63;
+    let ones = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
+    let mut code = Vec::with_capacity(48);
+    code.push(0x9C); // pushfq
+    code.push(0x50); // push rax
+    code.extend(movq_xmm_gpr(dst, 0, false)); // movq rax, xmm_dst
+    if idx > 0 {
+        code.extend([0x48, 0xC1, 0xE8, idx]); // shr rax, idx
+    }
+    if len < 64 {
+        code.push(0x51); // push rcx
+        code.extend([0x48, 0xB9]); // movabs rcx, ones
+        code.extend(ones.to_le_bytes());
+        code.extend([0x48, 0x21, 0xC8]); // and rax, rcx
+        code.push(0x59); // pop rcx
+    }
+    code.extend(movq_xmm_gpr(dst, 0, true)); // movq xmm_dst, rax (zeros high 64 bits)
+    code.push(0x58); // pop rax
+    code.push(0x9D); // popfq
+    let end = stub + code.len();
+    code.extend(jump(end, at + insn_len)?);
+    Some(code)
+}
+
+/// Native stub for `insertq xmm_dst, xmm_src, imm_len, imm_idx` at `at`
+/// (length `insn_len`), placed at `stub`. Preserves all GPRs, EFLAGS, and
+/// other XMMs; zeros `xmm_dst.High`, matching the emulator.
+fn insertq_imm_stub(
+    at: usize,
+    insn_len: usize,
+    stub: usize,
+    dst: u8,
+    src: u8,
+    imm_len: u8,
+    imm_idx: u8,
+) -> Option<Vec<u8>> {
+    let len = match imm_len & 63 {
+        0 => 64u32,
+        n => u32::from(n),
+    };
+    let idx = imm_idx & 63;
+    let ones = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
+    let mask = ones.checked_shl(u32::from(idx)).unwrap_or(0);
+    let keep_mask = !mask;
+    let mut code = Vec::with_capacity(64);
+    code.push(0x9C); // pushfq
+    code.push(0x50); // push rax
+    code.push(0x51); // push rcx
+    code.push(0x52); // push rdx
+    code.extend(movq_xmm_gpr(dst, 0, false)); // movq rax, xmm_dst
+    code.extend(movq_xmm_gpr(src, 1, false)); // movq rcx, xmm_src
+    code.extend([0x48, 0xBA]); // movabs rdx, keep_mask
+    code.extend(keep_mask.to_le_bytes());
+    code.extend([0x48, 0x21, 0xD0]); // and rax, rdx
+    code.extend([0x48, 0xBA]); // movabs rdx, ones
+    code.extend(ones.to_le_bytes());
+    code.extend([0x48, 0x21, 0xD1]); // and rcx, rdx
+    if idx > 0 {
+        code.extend([0x48, 0xC1, 0xE1, idx]); // shl rcx, idx
+    }
+    code.extend([0x48, 0x09, 0xC8]); // or rax, rcx
+    code.extend(movq_xmm_gpr(dst, 0, true)); // movq xmm_dst, rax (zeros high 64 bits)
+    code.push(0x5A); // pop rdx
+    code.push(0x59); // pop rcx
+    code.push(0x58); // pop rax
+    code.push(0x9D); // popfq
+    let end = stub + code.len();
+    code.extend(jump(end, at + insn_len)?);
+    Some(code)
+}
+
+/// Replaces an immediate `extrq` or `insertq` instruction (`insn_len >= 5`) at
+/// `at` by a 5-byte `jmp rel32` to a native stub in [`STUBS`].
+///
+/// # Safety
+/// `at` is in mapped title code that stays mapped, and `code[..insn_len]` are
+/// its decoded instruction bytes.
+unsafe fn patch_sse4a(at: usize, code: &[u8], insn_len: usize, what: ConsoleOnly) -> bool {
+    if insn_len < 5 || code.len() < 5 || (at & 15) + 5 > 16 {
+        return false;
+    }
+    let Some(jmp) = emit_stub(at, |stub| match what {
+        ConsoleOnly::Extrq { dst, src: None, len, idx } => extrq_imm_stub(at, insn_len, stub, dst, len, idx),
+        ConsoleOnly::Insertq { dst, src, reg: false, len, idx } => {
+            insertq_imm_stub(at, insn_len, stub, dst, src, len, idx)
+        }
+        _ => None,
+    }) else {
         return false;
     };
-    if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
-        return false;
-    }
-    // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
-    unsafe {
-        std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
-        *used += body.len().next_multiple_of(16);
-        patch(at, [a, b, c, d, e], jump)
-    }
+    let was = [code[0], code[1], code[2], code[3], code[4]];
+    // SAFETY: atomic 16-byte patch of title code after the stub is in place.
+    unsafe { patch(at, was, jmp) }
 }
 
 /// The aligned 16 bytes `word` around address `at` with the bytes at `at` replaced; `None`
@@ -497,27 +637,43 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             *regs[r as usize & 15] = cpu;
         }
         // the low quadword changes; the high one is zeroed, as a Zen 5 does
-        ConsoleOnly::Extrq { dst, src, len, idx } => {
+        ConsoleOnly::Extrq { dst, src, len: flen, idx } => {
+            if src.is_none()
+                && patches_sse4a()
+                // SAFETY: `rip` is the faulting instruction in title code.
+                && unsafe { patch_sse4a(rip, &code, len, what) }
+            {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
             // SAFETY: the context's XMM registers (CONTEXT_FLOATING_POINT is captured for exceptions).
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
-            let (len, idx) = match src {
+            let (flen, idx) = match src {
                 Some(s) => {
                     let c = x[s as usize & 15].Low;
                     (c as u8, (c >> 8) as u8)
                 }
-                None => (len, idx),
+                None => (flen, idx),
             };
             let d = &mut x[dst as usize & 15];
-            d.Low = decode::extrq(d.Low, len, idx);
+            d.Low = decode::extrq(d.Low, flen, idx);
             d.High = 0;
         }
-        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+        ConsoleOnly::Insertq { dst, src, reg, len: flen, idx } => {
+            if !reg
+                && patches_sse4a()
+                // SAFETY: `rip` is the faulting instruction in title code.
+                && unsafe { patch_sse4a(rip, &code, len, what) }
+            {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
             // SAFETY: as above.
             let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
             let s = x[src as usize & 15];
-            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            let (flen, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (flen, idx) };
             let d = &mut x[dst as usize & 15];
-            d.Low = decode::insertq(d.Low, s.Low, len, idx);
+            d.Low = decode::insertq(d.Low, s.Low, flen, idx);
             d.High = 0;
         }
     }
@@ -649,5 +805,140 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+    }
+
+    /// Immediate `extrq` and `insertq` become native stubs on first fault:
+    /// they produce the exact same low quadword as the emulator, zero the
+    /// high quadword, preserve GPRs and flags, and never fault again.
+    #[test]
+    fn extrq_and_insertq_become_native_stubs() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        // Test cases: (is_insertq, dst, src, imm_len, imm_idx, dst_in, src_in)
+        let cases: &[(bool, u8, u8, u8, u8, u64, u64)] = &[
+            (false, 0, 0, 16, 16, 0x1234_5678_9ABC_DEF0, 0),
+            (false, 8, 0, 8, 24, 0xDEAD_BEEF_CAFE_BABE, 0),
+            (false, 0, 0, 0, 0, 0x0123_4567_89AB_CDEF, 0),
+            (true, 0, 1, 16, 16, 0x1122_3344_5566_7788, 0x0000_0000_0000_ABCD),
+            (true, 0, 1, 4, 60, 0x0000_0000_0000_0000, 0x0000_0000_0000_01FF),
+            (true, 0, 0, 8, 8, 0x0000_0000_0000_00AB, 0x0000_0000_0000_00AB),
+            (true, 9, 10, 12, 20, 0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_0000_05A5),
+            (true, 0, 1, 0, 0, 0x1111_2222_3333_4444, 0xDEAD_BEEF_CAFE_BABE),
+        ];
+        for &(is_insert, dst, src, ilen, iidx, d_in, s_in) in cases {
+            // SAFETY: executable test page of our own, freed at the end of the loop.
+            unsafe {
+                let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                assert_ne!(page, 0);
+                // Function signature: extern "system" fn(dst_in: u64, src_in: u64, out_hi: *mut u64) -> u64
+                // Windows x64: rcx = dst_in, rdx = src_in, r8 = out_hi
+                // Load dst_in into xmm(dst) with non-zero high qword, src_in into xmm(src),
+                // run the patched SSE4a instruction at offset 32, store high qword to *r8, return low qword in rax.
+                let mut code = Vec::new();
+                // Preserve callee-saved xmm(dst) / xmm(src) for Windows x64 ABI.
+                code.extend([0x48, 0x83, 0xEC, 0x28]); // sub rsp, 40
+                let save_xmm = |code: &mut Vec<u8>, reg: u8, disp: Option<u8>| {
+                    code.push(0xF3);
+                    if reg >= 8 {
+                        code.push(0x44);
+                    }
+                    code.extend([0x0F, 0x7F]);
+                    match disp {
+                        None => code.extend([0x04 | ((reg & 7) << 3), 0x24]),
+                        Some(d) => code.extend([0x44 | ((reg & 7) << 3), 0x24, d]),
+                    }
+                };
+                let load_xmm = |code: &mut Vec<u8>, reg: u8, disp: Option<u8>| {
+                    code.push(0xF3);
+                    if reg >= 8 {
+                        code.push(0x44);
+                    }
+                    code.extend([0x0F, 0x6F]);
+                    match disp {
+                        None => code.extend([0x04 | ((reg & 7) << 3), 0x24]),
+                        Some(d) => code.extend([0x44 | ((reg & 7) << 3), 0x24, d]),
+                    }
+                };
+                save_xmm(&mut code, dst, None);
+                if is_insert && src != dst {
+                    save_xmm(&mut code, src, Some(16));
+                }
+                // Build non-zero high qword in xmm(dst): movq xmm(dst), rcx; punpcklqdq xmm(dst), xmm(dst)
+                code.extend(movq_xmm_gpr(dst, 1, true));
+                // punpcklqdq xmm(dst), xmm(dst): 66 [REX] 0F 6C modrm
+                let rex_dd = 0x40 | ((dst >> 3) << 2) | (dst >> 3);
+                code.extend([0x66, rex_dd, 0x0F, 0x6C, 0xC0 | ((dst & 7) << 3) | (dst & 7)]);
+                if is_insert && src != dst {
+                    code.extend(movq_xmm_gpr(src, 2, true));
+                }
+                assert!(code.len() <= 64);
+                code.resize(64, 0x90);
+                // Encode the real SSE4a instruction at offset 64 (aligned to 16 -> guaranteed <= 16 bytes)
+                let insn_at = code.len();
+                if is_insert {
+                    code.push(0xF2);
+                    let rex = 0x40 | ((dst >> 3) << 2) | (src >> 3);
+                    if rex != 0x40 {
+                        code.push(rex);
+                    }
+                    code.extend([0x0F, 0x78, 0xC0 | ((dst & 7) << 3) | (src & 7), ilen, iidx]);
+                } else {
+                    code.push(0x66);
+                    let rex = 0x40 | (dst >> 3);
+                    if rex != 0x40 {
+                        code.push(rex);
+                    }
+                    code.extend([0x0F, 0x78, 0xC0 | (dst & 7), ilen, iidx]);
+                }
+                let insn_len = code.len() - insn_at;
+                // Extract low qword -> rax
+                code.extend(movq_xmm_gpr(dst, 0, false));
+                // Extract high qword -> rcx via psrldq + movq, store to [r8]
+                if dst >= 8 {
+                    code.extend([0x66, 0x41, 0x0F, 0x73, 0xD8 | (dst & 7), 8]);
+                } else {
+                    code.extend([0x66, 0x0F, 0x73, 0xD8 | (dst & 7), 8]);
+                }
+                code.extend(movq_xmm_gpr(dst, 1, false));
+                // mov [r8], rcx: 49 89 08
+                code.extend([0x49, 0x89, 0x08]);
+                // Restore callee-saved xmm registers and stack.
+                if is_insert && src != dst {
+                    load_xmm(&mut code, src, Some(16));
+                }
+                load_xmm(&mut code, dst, None);
+                code.extend([0x48, 0x83, 0xC4, 0x28]); // add rsp, 40
+                code.push(0xC3); // ret
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+
+                // Trigger first-fault emulation (which patches the instruction at page + 32)
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                ctx.Rip = (page + insn_at) as u64;
+                ctx.Anonymous.FltSave.XmmRegisters[dst as usize].Low = d_in;
+                ctx.Anonymous.FltSave.XmmRegisters[dst as usize].High = d_in as i64;
+                if is_insert && src != dst {
+                    ctx.Anonymous.FltSave.XmmRegisters[src as usize].Low = s_in;
+                }
+                assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                assert_eq!(ctx.Rip, (page + insn_at + insn_len) as u64);
+                let expected = if is_insert {
+                    decode::insertq(d_in, s_in, ilen, iidx)
+                } else {
+                    decode::extrq(d_in, ilen, iidx)
+                };
+                assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[dst as usize].Low, expected);
+                assert_eq!(ctx.Anonymous.FltSave.XmmRegisters[dst as usize].High, 0);
+
+                if patches_sse4a() {
+                    assert_eq!(*((page + insn_at) as *const u8), 0xE9, "patched to jmp rel32");
+                    // Run directly on the CPU with NO VEH handler: proves native execution without faulting!
+                    let run: extern "system" fn(u64, u64, *mut u64) -> u64 = std::mem::transmute(page);
+                    let mut out_hi = u64::MAX;
+                    let got = run(d_in, s_in, &mut out_hi);
+                    assert_eq!(got, expected, "native stub low qword mismatch for case ({is_insert}, {dst}, {src}, {ilen}, {iidx})");
+                    assert_eq!(out_hi, 0, "native stub must zero high qword");
+                }
+                VirtualFree(page as *mut _, 0, MEM_RELEASE);
+            }
+        }
     }
 }

@@ -61,11 +61,32 @@ enum Mode {
     ByTurns,
 }
 
+fn is_laptop() -> bool {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // BATTERY_FLAG_NO_SYSTEM_BATTERY = 128; BATTERY_FLAG_UNKNOWN = 255.
+    let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: plain out-struct filled by kernel32.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return false;
+    }
+    status.BatteryFlag != 128 && status.BatteryFlag != 255
+}
+
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
+        Ok("auto") => {
+            if is_laptop() {
+                tracing::info!(
+                    "laptop detected (system battery present): keeping VICTORY_CARD_AWAKE off to prevent thermal throttling and preserve CPU power budget (set VICTORY_CARD_AWAKE=1 to force)"
+                );
+                Mode::Off
+            } else {
+                Mode::On
+            }
+        }
         _ => Mode::Off,
     })
 }
