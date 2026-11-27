@@ -130,8 +130,9 @@ name to select it explicitly. With the launcher, pass
 
 On a card whose waves are 32 lanes (NVIDIA), a console compute program that
 needs its 64-lane waves takes the wave-wide form when no other form fits,
-instead of being refused: ten of the title's (particle visibility and
-emission, water volumetrics) make their pipelines on an RTX 3080 Laptop.
+instead of being refused: 21 of the title's (particles, water volumetrics,
+hair shadow masks, decal and liquid trails) and 3 of its console FidelityFX
+upscaler make their pipelines on an RTX 3080 Laptop.
 `VICTORY_WAVE_WIDE=0` turns it off. Two are still refused there:
 `CS_AlphTransmissionPrefilterMip` and `CS_DefragHeap_ComputeRelocations`.
 

@@ -4924,24 +4924,48 @@ impl<'a> Lower<'a> {
         cl
     }
 
+    /// The IR block that lowering block `block` belongs to, as `group_sync`'s callers pass it:
+    /// the current block (`cur_ir`), or the first or last lowering block of an IR block
+    /// (`self.block`, `self.tail`). None for the entry block, which every thread runs, and for
+    /// a block not found (its caller checked the IR block itself).
+    fn ir_block_of(&self, block: usize) -> Option<usize> {
+        if block == self.s.entry {
+            return None;
+        }
+        if block == self.cur {
+            return Some(self.cur_ir);
+        }
+        let of = |v: &[Option<usize>]| v.iter().position(|&t| t == Some(block));
+        of(&self.tail).or_else(|| of(&self.block))
+    }
+
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
-        if !self.all_lanes(block) {
+        // (`all_lanes` and `need` take IR blocks; `block` is a lowering block)
+        let ir = self.ir_block_of(block);
+        if let Some(b) = ir
+            && !self.all_lanes(b)
+        {
             // A group barrier is run by every thread of the group or the group hangs. Where
             // the block holding this one is a block not every lane runs, the widening has to
             // take the branches around it wave-wide (`need`), and the program is refused if
             // that cannot be done - which is what `widen` decides from these needs.
-            need(block);
+            need(b);
         }
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
             let st = self.x.st;
-            let (in_loop, exits_wide, exits_known) = barrier_loop_state(st, block);
-            let entries = loop_entry_wide(st, block);
-            eprintln!(
-                "BARRIER block={block} all_lanes={} in_loop={in_loop} exits_wide={exits_wide} exits_known={exits_known} entry_wide={entries} wide_block={}",
-                self.all_lanes(block),
-                st.wide.contains(&block)
-            );
+            match ir {
+                Some(b) => {
+                    let (in_loop, exits_wide, exits_known) = barrier_loop_state(st, b);
+                    let entries = loop_entry_wide(st, b);
+                    eprintln!(
+                        "BARRIER block={b} all_lanes={} in_loop={in_loop} exits_wide={exits_wide} exits_known={exits_known} entry_wide={entries} wide_block={}",
+                        self.all_lanes(b),
+                        st.wide.contains(&b)
+                    );
+                }
+                None => eprintln!("BARRIER block=entry-or-unmapped (the entry, or a block its caller checked)"),
+            }
         }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
