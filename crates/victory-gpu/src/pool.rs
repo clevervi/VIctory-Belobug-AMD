@@ -61,6 +61,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
+        } else if crate::residency::limited_host_ram() {
+            limit.min(STAGING_KEPT / 2)
         } else {
             limit
         };
@@ -69,8 +71,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    const GIB: u64 = 1 << 30;
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            if budget > 16 * GIB {
+                SPARE_KEPT
+            } else if budget >= 11 * GIB {
+                24
+            } else {
+                12
+            }
+        }
         _ => SPARE,
     }
 }
@@ -783,9 +794,11 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GIB: u64 = 1 << 30;
+        let budget = 20 * GIB;
+        assert_eq!(spares(Some([budget, budget * 84 / 100, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([budget, budget * 85 / 100, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([budget, budget * 10 / 100, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 
@@ -935,5 +948,19 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn spares_scales_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        // 24 GiB card (e.g. RX 7900 XTX): full 4 GiB spare budget below 85%.
+        assert_eq!(spares(Some([23 * GIB, 10 * GIB, 0, 0]), true), SPARE_KEPT);
+        // 16 GiB card (e.g. RTX 3080 Laptop / RX 9070 XT): 1.5 GiB spare budget.
+        assert_eq!(spares(Some([15 * GIB, 8 * GIB, 0, 0]), true), 24);
+        // 8-10 GiB card: 768 MiB spare budget.
+        assert_eq!(spares(Some([8 * GIB, 4 * GIB, 0, 0]), true), 12);
+        // Above 85% or keep=false: drop to SPARE (2).
+        assert_eq!(spares(Some([15 * GIB, 13 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([23 * GIB, 10 * GIB, 0, 0]), false), SPARE);
     }
 }

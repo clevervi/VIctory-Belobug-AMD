@@ -563,6 +563,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        trim_spare_batch_buffers();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -1314,7 +1315,7 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     if buffers.is_empty() {
         return;
     }
-    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 16 };
+    let limit = if keep_freed() && !crate::residency::pressured() { SPARE_BATCH_MAX } else { 16 };
     let mut overflow = Vec::new();
     {
         let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -1327,6 +1328,17 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
         }
     }
     drop(overflow);
+}
+
+fn trim_spare_batch_buffers() {
+    let freed: Vec<BatchBuf> = {
+        let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *spare)
+    };
+    drop(freed);
 }
 
 /// A host command list and its allocator, always used together.

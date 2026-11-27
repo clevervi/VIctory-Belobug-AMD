@@ -2946,17 +2946,22 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
-/// Optional byte cap for loose title-window copies, in MiB. Unset or `0`
-/// keeps today's sweep. A positive value caps the copies only in the Watch
-/// and High RAM bands; Calm is unchanged.
+/// Optional byte cap for loose title-window copies, in MiB. On <= 32 GiB RAM
+/// hosts (`residency::limited_host_ram`), defaults to 1,024 MiB (Watch) /
+/// 512 MiB (High) so loose buffer mirrors do not push the PC into OOM; Calm
+/// stays uncapped. Set `VICTORY_WINDOW_BUDGET_MB=0` to disable, or any MiB
+/// value to override. On 64 GiB+ hosts, unset keeps today's uncapped sweep.
 fn window_budget() -> Option<u64> {
     static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *MB.get_or_init(|| {
-        std::env::var("VICTORY_WINDOW_BUDGET_MB")
+    *MB.get_or_init(|| match std::env::var("VICTORY_WINDOW_BUDGET_MB") {
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
             .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .map(|v| v.saturating_mul(1 << 20))
+            .filter(|&n| n > 0)
+            .map(|n| n.saturating_mul(1 << 20)),
+        Err(_) if crate::residency::limited_host_ram() => Some(1024 << 20),
+        Err(_) => None,
     })
 }
 
