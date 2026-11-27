@@ -147,6 +147,26 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+/// The debug overlay (Ctrl+F10, `victory_gpu::overlay`) shows the pad the
+/// title reads on `values[target]` (the first connected pad, with the
+/// keyboard and mouse when `[controls]` is on, else the keyboard's
+/// stand-in). The title keeps its input while it shows.
+fn overlay(values: &[Option<PadState>], target: usize) {
+    #[cfg(windows)]
+    {
+        use victory_gpu::overlay::{Pad, show_pad};
+        let read = values[target].or_else(|| values.iter().flatten().next().copied());
+        show_pad(read.map(|read| Pad {
+            buttons: read.buttons,
+            triggers: [read.left_trigger, read.right_trigger],
+            left: [read.left_x, read.left_y],
+            right: [read.right_x, read.right_y],
+        }));
+    }
+    #[cfg(not(windows))]
+    let _ = (values, target);
+}
+
 /// Two pads as one: buttons of both, and of each axis and trigger the one
 /// pushed further.
 fn merged(a: PadState, b: PadState) -> PadState {
@@ -589,6 +609,7 @@ impl State {
             None if base.is_none() => values[FALLBACK] = Some(fallback(&self.keys)),
             None => {}
         }
+        overlay(&values, target);
         for (index, value) in values.into_iter().enumerate() {
             self.update(devices, index, value.map(Value::Pad), now, events);
         }
@@ -781,6 +802,9 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // The debug overlay times input to present from the frame's first read.
+    #[cfg(windows)]
+    victory_gpu::overlay::note_input_read();
     let hub = hub(this);
     let mut state = hub.state();
     if kind & GAMEPAD_KIND != 0 {
