@@ -2982,6 +2982,20 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
 
+    /// [`make_null`](Self::make_null) for a slot the title gave a constant
+    /// buffer: with renderer port 5 on a heap without raw twins the shader
+    /// reads the slot itself as raw bytes, so its null is a buffer's.
+    pub(crate) fn make_null_constant(&self, index: u32) {
+        if !self.sampler && crate::port_cbv::on() && self.raw == 0 {
+            null_buffer_view(self.at(index));
+            self.put(index);
+            self.clear_twin(index);
+            self.keep(index, None);
+            return;
+        }
+        self.make_null(index);
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
