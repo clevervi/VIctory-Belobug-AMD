@@ -5646,8 +5646,62 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last frame line: askings for such copies, copies made, and of
+/// those the ones made on a spare buffer.
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The buffer of an [`exact`] copy let go, kept for the next copy of its size.
+struct Spare {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    gpu: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; `data` is the buffer's own
+// mapping, used by the one copy that takes the spare.
+unsafe impl Send for Spare {}
+
+/// Spare buffers of [`exact`] copies by size (a multiple of 256), and their
+/// bytes. The title places those views at ring positions that move every
+/// frame: ~140 copies a frame were made and as many let go, each a buffer
+/// of the driver's (made, mapped and waited for: the list threads' long
+/// calls of 2026-11-27, 120-160 ms a frame).
+static EXACT_SPARE: Mutex<(u64, BTreeMap<u64, Vec<Spare>>)> = Mutex::new((0, BTreeMap::new()));
+
+/// The most bytes [`EXACT_SPARE`] keeps (14 MB were in use in the world on
+/// 2026-11-27; the PC's memory is what limits play on 32 GB machines).
+const SPARE_MOST: u64 = 64 << 20;
+
+/// A spare buffer of exactly `size` bytes, if one is kept.
+fn spare_take(size: u64) -> Option<Spare> {
+    let mut guard = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, by_size) = &mut *guard;
+    let spares = by_size.get_mut(&size)?;
+    let spare = spares.pop()?;
+    if spares.is_empty() {
+        by_size.remove(&size);
+    }
+    *bytes -= size;
+    Some(spare)
+}
+
+/// Keeps the buffer of a copy let go, when nothing else holds the copy (no
+/// list, no slot: its buffer is idle on the card too) and there is room.
+/// A copy made on it starts with no page copied ([`Shadow::new`]): the
+/// spare's old bytes are copied over before any list reads them.
+fn spare_give(shadow: Arc<Shadow>) {
+    let Ok(shadow) = Arc::try_unwrap(shadow) else { return };
+    let size = shadow.len.next_multiple_of(256);
+    let spare = Spare { buffer: shadow.buffer.clone(), data: shadow.data, gpu: shadow.gpu };
+    drop(shadow);
+    let mut guard = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, by_size) = &mut *guard;
+    if *bytes + size > SPARE_MOST {
+        return; // (let go after the lock)
+    }
+    *bytes += size;
+    by_size.entry(size).or_default().push(spare);
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5676,31 +5730,80 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    // Buffers are made and let go without the lock: every list thread asks
+    // here, and making one took ~200 ms with the PC's memory short (the
+    // driver commits and zeroes it), all list threads waiting behind it
+    // (timeline of 2026-11-27: four frames of 480-800 ms out of it).
+    let gone: Vec<(Arc<Shadow>, u64)>;
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        gone = if map.len() >= MANY { take_idle(map, now, LATELY) } else { Vec::new() };
+    }
+    for (shadow, _) in gone {
+        spare_give(shadow);
+    }
+    let size = len.next_multiple_of(256);
+    let (buffer, data, gpu) = match spare_take(size) {
+        Some(Spare { buffer, data, gpu }) => {
+            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+            // The bytes past the copy's own up to the buffer's end are never
+            // copied, and a view may reach into them: zeros, as in a new buffer.
+            // SAFETY: the buffer's own mapping, `size` bytes, taken by this copy alone.
+            unsafe { std::ptr::write_bytes(data.add(len as usize), 0, (size - len) as usize) };
+            (buffer, data, gpu)
+        }
+        None => {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (buffer, data, gpu)
+        }
+    };
+    let made = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (tick, map) = &mut *guard;
-    *tick += 1;
     let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
-    }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    let (shadow, used) = map.entry((address, len)).or_insert_with(|| {
+        EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+        (made.clone(), now)
+    });
+    // (Another thread made one meanwhile: theirs is used, ours is kept spare
+    // after the lock.)
+    *used = now;
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    let shadow = shadow.clone();
+    drop(guard);
+    spare_give(made);
     Some(shadow)
+}
+
+/// The copies [`exact`] keeps that are held by its map alone (no list), whose
+/// buffer is held by the copy alone (no slot shows it), and that were not
+/// asked for in the last `lately` askings: taken out, to be let go after the
+/// lock.
+fn take_idle<K: Ord + Copy>(
+    map: &mut BTreeMap<K, (Arc<Shadow>, u64)>,
+    now: u64,
+    lately: u64,
+) -> Vec<(Arc<Shadow>, u64)> {
+    let idle: Vec<K> = map
+        .iter()
+        .filter(|(_, (shadow, used))| {
+            Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) <= 1 && *used + lately <= now
+        })
+        .map(|(key, _)| *key)
+        .collect();
+    idle.into_iter().filter_map(|key| map.remove(&key)).collect()
 }
 
 /// Copies of single views' bytes made since the start.
@@ -5710,17 +5813,74 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).0;
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on spare buffers), {kept} kept, {} MB spare",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        reused as f64 / frames,
+        spare >> 20
     );
+}
+
+#[cfg(all(test, windows))]
+mod exact_tests {
+    use std::sync::Arc;
+
+    /// Threads asking at once for the copy of the same view bytes, which is
+    /// made without the lock, all get the one the map keeps.
+    #[test]
+    fn concurrent_askings_share_one_copy() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        // An address no other test asks for (dword-aligned, under 64 MiB).
+        let (address, len) = (0x7e57_0000_0000u64, 4096u64);
+        let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(move || super::exact(address, len))).collect();
+        let got: Vec<_> = threads.into_iter().map(|t| t.join().unwrap().expect("a copy")).collect();
+        assert!(got.iter().all(|s| Arc::ptr_eq(s, &got[0])));
+        let kept = super::EXACT.lock().unwrap().1.get(&(address, len)).map(|(s, _)| s.clone()).unwrap();
+        assert!(Arc::ptr_eq(&kept, &got[0]));
+        // Asked again: the same copy, not a new one.
+        assert!(Arc::ptr_eq(&super::exact(address, len).unwrap(), &got[0]));
+    }
+
+    /// A copy nothing else holds gives its buffer back, a held one does not,
+    /// and the next copy of that size is made on it.
+    #[test]
+    fn a_copy_let_go_lends_its_buffer_to_the_next_of_its_size() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        // A size no other test asks for (a multiple of 256).
+        let (address, len) = (0x7e58_0000_0000u64, 3 * 4096 + 256);
+        let copy = super::exact(address, len).unwrap();
+        let gpu = copy.gpu;
+        let removed = super::EXACT.lock().unwrap().1.remove(&(address, len)).unwrap().0;
+        let held = copy.clone();
+        drop(copy);
+        // Held elsewhere: not kept spare.
+        super::spare_give(removed);
+        assert!(super::spare_take(len).is_none());
+        super::spare_give(held);
+        let spare = super::spare_take(len).expect("a spare");
+        assert_eq!(spare.gpu, gpu);
+        // Bytes past the copy's own, left by the last user, read as zeros again.
+        // SAFETY: the spare's own mapping, `len` bytes (a multiple of 256).
+        unsafe { std::ptr::write_bytes(spare.data, 0xab, len as usize) };
+        super::spare_give(Arc::new(super::Shadow::new(spare.buffer, spare.data, spare.gpu, address, len)));
+        let again = super::exact(address + 4, len - 100).unwrap();
+        assert_eq!(again.gpu, gpu);
+        // SAFETY: the copy's own mapping, `len` bytes.
+        let tail = unsafe { std::slice::from_raw_parts(again.data.add((len - 100) as usize), 100) };
+        assert!(tail.iter().all(|&b| b == 0));
+    }
 }
 
 #[cfg(test)]
