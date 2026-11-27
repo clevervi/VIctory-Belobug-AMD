@@ -4,6 +4,7 @@
 # -Ports        enable renderer ports 1, 2, 5, 6, 7 and VICTORY_SETTLE_ROOM=1
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Fsr4K        PC FidelityFX at 3840x2160 (quality, balanced or performance): FSR 4.1.2 where AMD's SDK offers it for the card, FSR 3.1 otherwise
+# -Console      series-x (the title's default) or series-s: 1080p output, about 5 ms faster, a softer picture
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 #               Light DRED is requested by default for diag and requires --features diagnostics.
 # -More         other settings: -More @{VICTORY_PANEL='1'}
@@ -14,6 +15,7 @@ param(
     [switch]$Ports,
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
+    [ValidateSet('series-x', 'series-s')][string]$Console,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -53,4 +55,6 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+$run = @('run', $Exe, '--execute')
+if ($Console) { $run += '--console', $Console }
+try { & $victory @run } finally { Pop-Location }
