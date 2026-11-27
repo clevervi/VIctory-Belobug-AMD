@@ -16,10 +16,23 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 const MIB: u64 = 1 << 20;
 
-/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
+/// `VICTORY_RESIDENCY`: host-memory admission and pressure budgets.
+/// Automatically enabled on machines with 36 GiB of physical RAM or less
+/// (32 GiB hosts) so they do not OOM; stays off on 64 GiB+ hosts unless
+/// `VICTORY_RESIDENCY=1`. Set `VICTORY_RESIDENCY=0` to force off.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_RESIDENCY").as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => {
+            let auto = memory_status().is_some_and(|s| s.ullTotalPhys <= 36 * GIB);
+            if auto {
+                tracing::info!("host RAM <= 36 GiB: enabling VICTORY_RESIDENCY memory pressure guard automatically (set VICTORY_RESIDENCY=0 to disable)");
+            }
+            auto
+        }
+    })
 }
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
