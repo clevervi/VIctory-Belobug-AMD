@@ -519,9 +519,10 @@ fn twin_texture(
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
-    // The buffer a stencil plane and its twin are copied through: as big
-    // as the plane's mips and slices laid out for a copy (they follow the
-    // depth plane's in the texture's subresources).
+    // The buffer a stencil plane and its twin are copied through: shared per
+    // power-of-two size across twins (after Marvisak #2162). Each copy starts
+    // and ends in COMMON and lists run sequentially on the single host queue,
+    // saving hundreds of MiB of VRAM when many stencil twins are alive.
     let through = if stencil {
         // SAFETY: a live texture.
         let of = unsafe { depth.GetDesc() };
@@ -540,7 +541,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = shared_twin_through(host, bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
@@ -592,6 +593,31 @@ fn twin_texture(
         through,
         plane,
     }))
+}
+
+/// Shared scratch buffers for stencil depth-twin copies, one per power-of-two
+/// size (after Marvisak #2162). Each copy starts and ends in COMMON on the
+/// single host queue, so sharing saves hundreds of MiB of VRAM across twins.
+#[cfg(windows)]
+fn shared_twin_through(
+    host: &crate::host::Host,
+    bytes: u64,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    struct Pool(Vec<(u64, ID3D12Resource)>);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Pool {}
+    static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool(Vec::new()));
+
+    let class = bytes.max(1 << 16).next_power_of_two();
+    let mut all = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = host.uav_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin through {class:#x}"));
+    all.0.push((class, buffer.clone()));
+    Some(buffer)
 }
 
 /// The typeless format of a format's family (itself if it has none).
