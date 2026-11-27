@@ -417,7 +417,7 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let len = MARKS.len.load(Acquire);
     if len != 0 && n >= 4 {
         let start = MARKS.start.load(Relaxed);
-        let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
+        let (lo, hi) = ((to as u64).max(start), (to as u64).saturating_add(n as u64).min(start + len));
         if lo < hi {
             COPIES[0].fetch_add(1, Relaxed);
             // Each slot whose first word now lies in the copy and is a view's.
@@ -471,7 +471,7 @@ unsafe extern "system-unwind" fn title_copy(to: *mut u8, from: *const u8, n: usi
 }
 
 /// Marks every slot of the marked heap with a byte in `[to, to + n)`: how many.
-fn mark_range(to: u64, n: u64) -> u64 {
+pub(crate) fn mark_range(to: u64, n: u64) -> u64 {
     let len = MARKS.len.load(Acquire);
     if len == 0 || n == 0 {
         return 0;

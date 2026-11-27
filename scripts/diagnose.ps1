@@ -144,25 +144,47 @@ if ($Interactive) {
     Add-Type @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class VictoryWinShow {
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_SHOWWINDOW = 0x0040;
     public static bool Reveal(int targetPid) {
         bool shown = false;
+        var cls = new StringBuilder(64);
         EnumWindows((h, _) => {
             uint pid;
             GetWindowThreadProcessId(h, out pid);
             if (pid == (uint)targetPid) {
+                cls.Clear();
+                GetClassName(h, cls, cls.Capacity);
+                string c = cls.ToString();
+                if (c == "ConsoleWindowClass" || c == "PseudoConsoleWindow" || c == "IME" || c == "MSCTFIME UI") {
+                    return true;
+                }
                 RECT r;
                 if (GetWindowRect(h, out r) && (r.Right - r.Left) >= 300 && (r.Bottom - r.Top) >= 200) {
+                    // Two ShowWindow calls ensure Windows consumes any inherited STARTF_USESHOWWINDOW=SW_HIDE.
+                    ShowWindow(h, 9); // SW_RESTORE
                     ShowWindow(h, 5); // SW_SHOW
+                    SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                    BringWindowToTop(h);
                     SetForegroundWindow(h);
-                    shown = true;
+                    if (IsWindowVisible(h) && !IsIconic(h)) {
+                        shown = true;
+                    }
                 }
             }
             return true;
@@ -181,19 +203,37 @@ $exitedEarly = $false
 $exitCode = 0
 $revealed = $false
 $sw = [Diagnostics.Stopwatch]::StartNew()
+$nextSampleAt = [double]$SampleInterval
 try {
-    $proc = Start-Process -FilePath $victory -ArgumentList $argsList -WorkingDirectory $repoRoot `
-        -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+    # In -Interactive mode use -WindowStyle Normal (instead of -NoNewWindow) so
+    # Windows does not propagate SW_HIDE to the title's first ShowWindow call
+    # when launched from a hidden/non-interactive parent shell.
+    $startParams = @{
+        FilePath               = $victory
+        ArgumentList           = $argsList
+        WorkingDirectory       = $repoRoot
+        RedirectStandardOutput = $stdoutPath
+        RedirectStandardError  = $stderrPath
+        PassThru               = $true
+    }
+    if ($Interactive) {
+        $startParams.WindowStyle = 'Normal'
+    } else {
+        $startParams.NoNewWindow = $true
+    }
+    $proc = Start-Process @startParams
 
     while (-not $proc.HasExited) {
         if (-not $Interactive -and $sw.Elapsed.TotalSeconds -ge $Seconds) { break }
-        if ($Interactive -and -not $revealed) {
-            Start-Sleep -Milliseconds 1000
+        if ($Interactive -and -not $revealed -and $sw.Elapsed.TotalSeconds -lt 30) {
+            Start-Sleep -Milliseconds 500
             if (-not $proc.HasExited) { $revealed = [VictoryWinShow]::Reveal($proc.Id) }
-            continue
+            if ($sw.Elapsed.TotalSeconds -lt $nextSampleAt) { continue }
+        } else {
+            Start-Sleep -Seconds $SampleInterval
         }
-        Start-Sleep -Seconds $SampleInterval
         if ($proc.HasExited) { break }
+        $nextSampleAt = $sw.Elapsed.TotalSeconds + $SampleInterval
         $pInfo = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
         if (-not $pInfo) { break }
         $wsMiB = [math]::Round($pInfo.WorkingSet64 / 1MB)
@@ -252,6 +292,8 @@ $deviceLost   = @($cleanErr | Select-String -Pattern 'device lost|DXGI_ERROR_DEV
 $pressureHits = @($cleanErr | Select-String -Pattern 'host memory pressure:')
 $errorLines   = @($cleanErr | Select-String -Pattern '\sERROR\s')
 $warnLines    = @($cleanErr | Select-String -Pattern '\sWARN\s')
+$port2Missed  = @($cleanErr | Select-String -Pattern 'renderer port 2: a view record in the title''s heap that no store told of')
+$occludedHits = @($cleanErr | Select-String -Pattern 'HRESULT\(0x087A0001\)')
 $sse4aLines   = @($cleanErr | Select-String -Pattern 'console CPU instructions that fault')
 $frameLines   = @($cleanErr | Select-String -Pattern 'frame presented')
 $fpsLines     = @($cleanErr | Select-String -Pattern 'draws/frame')
@@ -308,6 +350,9 @@ $summary = [ordered]@{
     memory_pressure_count = $pressureHits.Count
     error_count = $errorLines.Count
     warn_count = $warnLines.Count
+    port2_missed_count = $port2Missed.Count
+    occluded_count = $occludedHits.Count
+    window_revealed = $revealed
     output_dir = $outDir
 }
 $summary | ConvertTo-Json -Depth 4 | Set-Content $reportJson
@@ -320,7 +365,7 @@ Write-Host ("RAM Peak       : WS={0} MiB | Private={1} MiB | MinFreeRAM={2} MiB 
 if ($null -ne $peakVram) {
     Write-Host ("GPU Peak       : VRAM={0} MiB | Util={1}% | Temp={2}C" -f $peakVram, $peakUtil, $peakTemp)
 }
-Write-Host ("Port 2 Patched : {0} sites | Refused pipelines: {1} | Errors: {2} | Warns: {3} | Pressure: {4}" -f $port2Lines.Count, $refusedLines.Count, $errorLines.Count, $warnLines.Count, $pressureHits.Count)
+Write-Host ("Port 2 Patched : {0} sites (missed={1}) | Refused: {2} | Errors: {3} | Warns: {4} | Occluded: {5} | Pressure: {6}" -f $port2Lines.Count, $port2Missed.Count, $refusedLines.Count, $errorLines.Count, $warnLines.Count, $occludedHits.Count, $pressureHits.Count)
 if ($summary.frames_logged)     { Write-Host ("Last Frame     : {0}" -f $summary.frames_logged) }
 if ($summary.fps_last)          { Write-Host ("Last FPS/World : {0}" -f $summary.fps_last) }
 if ($summary.shader_cache_last) { Write-Host ("Shader Cache   : {0}" -f $summary.shader_cache_last) }

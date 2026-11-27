@@ -359,6 +359,36 @@ impl Drop for SyncedHeaps {
     }
 }
 
+/// Appends the sub-ranges of `[page_from, page_to)` not already covered by the
+/// sorted, disjoint `taken` runs to `out` with `check = true`.
+#[cfg(any(windows, test))]
+fn push_unchecked_page(
+    page_from: usize,
+    page_to: usize,
+    taken: &[(usize, usize)],
+    out: &mut Vec<(usize, usize, bool)>,
+) {
+    if page_from >= page_to {
+        return;
+    }
+    let mut i = taken.partition_point(|&(_, to)| to <= page_from);
+    let mut cur = page_from;
+    while i < taken.len() && taken[i].0 < page_to {
+        let (t_from, t_to) = taken[i];
+        if cur < t_from {
+            out.push((cur, t_from.min(page_to), true));
+        }
+        cur = cur.max(t_to);
+        if cur >= page_to {
+            return;
+        }
+        i += 1;
+    }
+    if cur < page_to {
+        out.push((cur, page_to, true));
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -428,9 +458,12 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
+            let mut taken_ranges: Vec<(usize, usize)> = Vec::new();
             for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
                 let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
+                let to = from + n as usize * step as usize;
+                taken_ranges.push((from, to));
+                parts.push((from, to, false));
             }
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
@@ -442,7 +475,15 @@ pub(crate) fn sync_heaps() {
                 crate::port_descriptors::asked(&taken);
             }
             for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                // Subtract the runs already taken above so parallel sync jobs
+                // never race on `copied` and slots whose marks were just taken
+                // are not falsely reported as missed by the fallback.
+                push_unchecked_page(
+                    page.max(start as usize),
+                    (page + crate::watch::PAGE).min(end as usize),
+                    &taken_ranges,
+                    &mut parts,
+                );
             }
         } else {
             let began = std::time::Instant::now();
@@ -1468,6 +1509,10 @@ fn record(handle: u64, view: View) {
         return;
     }
     let [i, generation] = words_for(view);
+    // Mark before writing so a concurrent port #2 fallback scan cannot see the
+    // new `VIEW_TAG` record before `mirror` marks it.
+    #[cfg(windows)]
+    crate::port_descriptors::mark(handle);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
@@ -1629,6 +1674,13 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     };
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
+        // Mark the whole destination span before and after copying so a
+        // concurrent port #2 fallback scan never flags slots written by `put`
+        // while the per-slot `mirror` loop is still running.
+        #[cfg(windows)]
+        if kind == VIEWS_KIND {
+            crate::port_descriptors::mark_range(dst, len);
+        }
         // SAFETY: both ranges are descriptor slots the title owns.
         #[cfg(windows)]
         unsafe {
@@ -1639,6 +1691,10 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         unsafe {
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
+        #[cfg(windows)]
+        if kind == VIEWS_KIND {
+            crate::port_descriptors::mark_range(dst, len);
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
@@ -2090,5 +2146,34 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn push_unchecked_page_subtracts_taken_runs() {
+        let mut out = Vec::new();
+        push_unchecked_page(0x1000, 0x2000, &[], &mut out);
+        assert_eq!(out, [(0x1000, 0x2000, true)]);
+
+        out.clear();
+        push_unchecked_page(
+            0x1000,
+            0x2000,
+            &[(0x0800, 0x1000), (0x1100, 0x1300), (0x1800, 0x1900), (0x2000, 0x2400)],
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            [(0x1000, 0x1100, true), (0x1300, 0x1800, true), (0x1900, 0x2000, true)]
+        );
+
+        // Partial overlaps at both ends.
+        out.clear();
+        push_unchecked_page(0x1000, 0x2000, &[(0x0f00, 0x1200), (0x1e00, 0x2200)], &mut out);
+        assert_eq!(out, [(0x1200, 0x1e00, true)]);
+
+        // Fully covered page produces nothing.
+        out.clear();
+        push_unchecked_page(0x1000, 0x2000, &[(0x0000, 0x3000)], &mut out);
+        assert!(out.is_empty());
     }
 }
