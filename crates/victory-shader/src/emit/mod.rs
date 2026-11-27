@@ -566,10 +566,14 @@ pub fn emit(
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
             || WAVE_WIDE_HERE.get();
-        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
-        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
-        // the programs the approximate forms already take keep their barrier-free form.
-        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        // The same form, but only for programs that every other form below leaves at 64
+        // lanes (on a 32-lane host those are refused outright), so the programs the
+        // approximate forms already take keep their barrier-free form. On by default (unset
+        // or `last`): `widen` now refuses a program that would keep a barrier where not every
+        // lane runs, and widens the branches that leave a loop holding one, so what it gives
+        // can no longer hang the group; without it the program's dispatches are dropped
+        // (GpuParticleUpdate:CS_Visibility on an RTX 3080). `VICTORY_WAVE_WIDE=0` turns it off.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
