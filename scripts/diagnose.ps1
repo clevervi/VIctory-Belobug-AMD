@@ -140,19 +140,58 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
 Write-Host "`n[2/3] Launching title ($(if ($Interactive) { 'interactive - close window when done' } else { "${Seconds}s timed run" }), console=$Console, wave_wide=$WaveWide)..." -ForegroundColor Yellow
 
+if ($Interactive) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class VictoryWinShow {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    public static bool Reveal(int targetPid) {
+        bool shown = false;
+        EnumWindows((h, _) => {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pid == (uint)targetPid) {
+                RECT r;
+                if (GetWindowRect(h, out r) && (r.Right - r.Left) >= 300 && (r.Bottom - r.Top) >= 200) {
+                    ShowWindow(h, 5); // SW_SHOW
+                    SetForegroundWindow(h);
+                    shown = true;
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return shown;
+    }
+}
+"@ -ErrorAction SilentlyContinue
+}
+
 $argsList = @('run', '--console', $Console, $Exe, '--execute')
 $samples = [System.Collections.Generic.List[object]]::new()
 "elapsed_s,ws_mib,private_mib,free_ram_mib,free_commit_mib,vram_used_mib,vram_total_mib,gpu_util_pct,gpu_temp_c" | Set-Content $monPath
 
 $exitedEarly = $false
 $exitCode = 0
+$revealed = $false
 $sw = [Diagnostics.Stopwatch]::StartNew()
 try {
     $proc = Start-Process -FilePath $victory -ArgumentList $argsList -WorkingDirectory $repoRoot `
-        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+        -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 
     while (-not $proc.HasExited) {
         if (-not $Interactive -and $sw.Elapsed.TotalSeconds -ge $Seconds) { break }
+        if ($Interactive -and -not $revealed) {
+            Start-Sleep -Milliseconds 1000
+            if (-not $proc.HasExited) { $revealed = [VictoryWinShow]::Reveal($proc.Id) }
+            continue
+        }
         Start-Sleep -Seconds $SampleInterval
         if ($proc.HasExited) { break }
         $pInfo = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
