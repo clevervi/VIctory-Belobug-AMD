@@ -333,16 +333,18 @@ pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     out
 }
 
+/// Whether the `n`-th (0-based) missed view record since the start is said:
+/// the first 20, then at powers of two.
+fn should_warn_missed(n: u64) -> bool {
+    n < 20 || n.is_power_of_two()
+}
+
 /// The fallback found slot `index` (at `handle`) with a new record: a view
 /// record that no mark told of is counted and said.
 pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     if !view {
         CHECKED[2].fetch_add(1, Relaxed);
         return;
-    }
-    if tabled {
-        // A draw read it through a table lately: the draw makes it anyway.
-        CHECKED[5].fetch_add(1, Relaxed);
     }
     let adopted = ADOPTED.read().unwrap_or_else(|e| e.into_inner());
     let Some(a) = adopted.as_ref() else { return };
@@ -351,8 +353,15 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[3].fetch_add(1, Relaxed);
         return;
     }
-    let n = CHECKED[1].fetch_add(1, Relaxed);
-    MISSED_ALL.fetch_add(1, Relaxed);
+    CHECKED[1].fetch_add(1, Relaxed);
+    if tabled {
+        // A draw read it through a table lately: the draw makes it anyway.
+        // Counted only among the missed ones, which it is a part of.
+        CHECKED[5].fetch_add(1, Relaxed);
+    }
+    // The count since the start, not the one each frame line resets: the
+    // first 20 are said once, not again after every line.
+    let n = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
     let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
@@ -360,7 +369,7 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         *by.entry(writer.clone()).or_default() += 1;
     }
-    if n < 20 || n.is_power_of_two() {
+    if should_warn_missed(n) {
         tracing::warn!(
             slot = index,
             handle = format_args!("{handle:#x}"),
@@ -643,5 +652,46 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    /// A marked slot is pending, not missed and not tabled; a tabled slot
+    /// is counted among the missed ones; the warnings follow the count since
+    /// the start, which the frame line does not reset.
+    #[test]
+    fn missed_counts_tabled_after_marked_and_keeps_global_warn_counter() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let start = 0x3000_0000u64;
+        assert!(adopt_now(start, 256));
+        for c in &CHECKED {
+            c.store(0, Relaxed);
+        }
+        MISSED_ALL.store(0, Relaxed);
+        WRITERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        mark(start + 5 * 32);
+        missed(5, start + 5 * 32, true, true);
+        assert_eq!(CHECKED[3].load(Relaxed), 1);
+        assert_eq!(CHECKED[1].load(Relaxed), 0);
+        assert_eq!(CHECKED[5].load(Relaxed), 0);
+        assert_eq!(MISSED_ALL.load(Relaxed), 0);
+
+        missed(6, start + 6 * 32, true, true);
+        assert_eq!(CHECKED[1].load(Relaxed), 1);
+        assert_eq!(CHECKED[5].load(Relaxed), 1);
+        assert_eq!(MISSED_ALL.load(Relaxed), 1);
+
+        for i in 7..28 {
+            missed(i, start + u64::from(i) * 32, true, false);
+        }
+        CHECKED[1].store(0, Relaxed);
+        assert_eq!(MISSED_ALL.load(Relaxed), 22);
+        assert!(!should_warn_missed(22));
+        missed(28, start + 28 * 32, true, false);
+        assert_eq!(CHECKED[1].load(Relaxed), 1);
+        assert_eq!(MISSED_ALL.load(Relaxed), 23);
+        assert!(should_warn_missed(32) && !should_warn_missed(33));
+
+        let_go(start);
+        WRITERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
