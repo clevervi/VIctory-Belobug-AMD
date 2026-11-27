@@ -2219,6 +2219,13 @@ extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _f
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
+/// `Write32ImmediateX(address, value, flush)` (newer slot 90 / 0x2d0,
+/// observed in `XboxBvhBuilder.dll` initializing per-BVH fence counters):
+/// four-argument variant without a trailing flags parameter.
+pub(super) extern "system" fn write32_immediate(this: This, address: u64, value: u32, _flush: u32) {
+    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
@@ -2389,13 +2396,20 @@ const fn newer_slot(slot: usize) -> usize {
     if slot >= 59 { slot + 2 } else { slot }
 }
 
-/// Methods only newer titles' lists have. 0x490: the enhanced barrier
-/// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
-/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from the title's state flush with its result unused.
-/// shortcut: 0x470's purpose is unknown; ignored until a title shows it
-/// matters.
-const NEWER_METHODS: [(usize, *const ()); 3] = [
+/// Methods only newer titles' lists have:
+/// - 0x1d8 (slot 59): PIX event/marker writer `(is_begin, payload, bytes)`
+///   observed in `amd_fidelityfx_upscaler_xbox.dll::FUN_180006860`.
+/// - 0x2d0 (slot 90): `Write32ImmediateX(address, value, flush)` observed in
+///   `XboxBvhBuilder.dll::FUN_18000e6a0`.
+/// - 0x468 (slot 141): `SetComputeShaderScratchMemoryX(stage, va, size, stride)`
+///   observed in `amd_fidelityfx_upscaler_xbox.dll::FUN_1800059a0`.
+/// - 0x470 (slot 142): called from the title's state flush, result unused.
+/// - 0x490 (slot 146): enhanced barriers `(group count, groups)`.
+/// - 0x4a0 (slot 148): `AllocateUploadMemory(bytes, alignment)`.
+const NEWER_METHODS: [(usize, *const ()); 6] = [
+    (59, ignored_state as *const ()),
+    (90, write32_immediate as *const ()),
+    (141, ignored_state as *const ()),
     (142, ignored_state as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
@@ -2500,5 +2514,14 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn newer_list_console_slots_are_wired() {
+        let newer = list_table(true);
+        assert_eq!(newer[59], ignored_state as *const ()); // 0x1d8 PIX event
+        assert_eq!(newer[61], execute_indirect as *const ()); // 0x1e8 shifted ExecuteIndirect
+        assert_eq!(newer[90], write32_immediate as *const ()); // 0x2d0 Write32ImmediateX
+        assert_eq!(newer[141], ignored_state as *const ()); // 0x468 SetComputeShaderScratchMemoryX
     }
 }

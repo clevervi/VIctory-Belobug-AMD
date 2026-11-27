@@ -357,8 +357,10 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 ///   and keeps only the successes in a map; the pipeline builder
 ///   (title+0x2479760) looks there (title+0x2479f40) and on a miss calls
 ///   0x2b0, `create_stream`.
-/// - 0x218: title+0x247fd30 calls it through title+0x2480050 and on null
-///   calls 0x1f0, `create_compute_x`.
+/// - 0x218 (`DeserializeComputePipelineStateX`): title+0x247fd30 calls it
+///   through title+0x2480050 and `amd_fidelityfx_upscaler_xbox.dll` calls it
+///   for `'ACCC'` ACO blobs; on failure both fall back to 0x1f0,
+///   `create_compute_x`.
 ///
 /// Answering them makes things worse: native-only pipelines that do not
 /// translate replace ones that do (upstream VIctory pull request #3163:

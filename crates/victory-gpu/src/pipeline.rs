@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -773,12 +773,31 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
-/// IUnknown 3, object 4, device child 1, pipeline 3.
+/// Pipeline method 0x58 (slot 11): console shader scratch-memory info query
+/// `(this, stage, flags, out_blob)` observed in `amd_fidelityfx_upscaler_xbox.dll`
+/// (`FUN_180004aa0`, which reads `*blob << 10` bytes to size `FFX_XBox_ComputeScratch`
+/// for `list+0x468`). Returning `E_NOTIMPL` with `*out` null skips console scratch
+/// allocation cleanly because host D3D12 manages shader scratch internally.
+extern "system" fn shader_scratch_info(
+    _: This,
+    _stage: u32,
+    _flags: u32,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: caller-provided out pointer for the optional blob.
+        unsafe { *out = std::ptr::null() };
+    }
+    E_NOTIMPL
+}
+
+/// IUnknown 3, object 4, device child 1, pipeline 3 (+ console slot 11 / 0x58).
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
+    f[11] = shader_scratch_info as *const (); // 0x58
     Table(f)
 };
 
@@ -881,7 +900,20 @@ mod tests {
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
+        // Slot 0x58 (console shader scratch info) fails cleanly and zeroes out.
+        let mut blob: This = p;
+        assert_eq!(
+            slot::<extern "system" fn(This, u32, u32, *mut This) -> HRESULT>(p, 0x58)(
+                p,
+                0,
+                0,
+                &mut blob
+            ),
+            E_NOTIMPL
+        );
+        assert!(blob.is_null());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
     /// The stream layout the title builds (title+0x86f090): root

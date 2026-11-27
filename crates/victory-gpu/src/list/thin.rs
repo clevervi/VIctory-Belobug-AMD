@@ -581,6 +581,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
+extern "system" fn write32_immediate(this: This, address: u64, value: u32, flush: u32) {
+    write32(this, address, value, flush, 0);
+}
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
     front(this).put_with(VIEWPORTS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
@@ -876,6 +879,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
         i += 1;
     }
     if newer {
+        f[90] = write32_immediate as *const ();
         f[146] = barrier_groups as *const ();
         f[148] = allocate_upload as *const ();
     }

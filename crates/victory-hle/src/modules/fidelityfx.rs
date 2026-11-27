@@ -349,19 +349,76 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
     ))
 }
 
+/// Skips leading console-only backend and version-override nodes in a
+/// descriptor chain so the host PC SDK sees only our host backend and
+/// selected provider id.
+fn skip_console_prefix(mut next: *mut Header) -> *mut Header {
+    for _ in 0..16 {
+        // SAFETY: the title's descriptor chain.
+        let Some(h) = (unsafe { next.as_ref() }) else {
+            break;
+        };
+        if h.kind == CONSOLE_BACKEND || h.kind == OVERRIDE_VERSION {
+            next = h.next;
+        } else {
+            break;
+        }
+    }
+    next
+}
+
 /// Puts the host backend after the title's upscaler description, in place
-/// of the console's backend that follows it (where the title puts it);
-/// anywhere else the console's is left for the host DLL to ignore, ours
+/// of the console's backend (and any console version override) that follows
+/// it; anywhere else the console's is left for the host DLL to ignore, ours
 /// coming first.
 fn link(upscale: &mut CreateUpscale, backend: &mut Backend) {
-    let after = upscale.header.next;
-    // SAFETY: the title's chain.
-    backend.header.next = match unsafe { after.as_ref() } {
-        Some(h) if h.kind == CONSOLE_BACKEND => h.next,
-        _ => after,
-    };
+    backend.header.next = skip_console_prefix(upscale.header.next);
     backend.header.kind = HOST_BACKEND;
     upscale.header.next = &raw mut backend.header;
+}
+
+/// Temporarily splices the host DX12 backend and selected provider override
+/// onto a null-context `ffxQuery` descriptor chain (skipping any leading
+/// console backend or console version override) and restores `(*desc).next`
+/// before returning.
+fn with_null_context_query_chain<R>(
+    desc: *mut Header,
+    device: *mut c_void,
+    provider_id: u64,
+    call: impl FnOnce(*mut Header) -> R,
+) -> R {
+    struct Restore {
+        desc: *mut Header,
+        saved: *mut Header,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: `desc` stays valid for the duration of the FFX call.
+            unsafe { (*self.desc).next = self.saved };
+        }
+    }
+    // SAFETY: `desc` is non-null and writable per the FFX C API contract.
+    let saved = unsafe { (*desc).next };
+    let rest = skip_console_prefix(saved);
+    let mut requested = OverrideVersion {
+        header: Header {
+            kind: OVERRIDE_VERSION,
+            next: rest,
+        },
+        id: provider_id,
+    };
+    let mut backend = Backend {
+        header: Header {
+            kind: HOST_BACKEND,
+            next: &raw mut requested.header,
+        },
+        device,
+    };
+    let _restore = Restore { desc, saved };
+    // SAFETY: `backend` and `requested` outlive `call`; `_restore` drops first
+    // and reverts `(*desc).next` before either stack descriptor goes away.
+    unsafe { (*desc).next = &raw mut backend.header };
+    call(desc)
 }
 
 /// A FidelityFX resource state as the host resource state it means (as the
@@ -535,15 +592,33 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     if kind == GET_VERSIONS {
         let mut query = unsafe { *desc.cast::<GetVersions>() };
         query.device = host.device.as_raw();
+        query.header.next = skip_console_prefix(query.header.next);
         return unsafe { (host.query)(context, &mut query.header) };
     }
     if kind == MEMORY_USAGE_WITH_DEVICE {
         let mut query = unsafe { *desc.cast::<MemoryUsageWithDevice>() };
         query.device = host.device.as_raw();
+        let mut requested = OverrideVersion {
+            header: Header {
+                kind: OVERRIDE_VERSION,
+                next: skip_console_prefix(query.header.next),
+            },
+            id: host.provider_id,
+        };
+        query.header.next = &raw mut requested.header;
         return unsafe { (host.query)(context, &mut query.header) };
     }
-    // SAFETY: as above.
-    let code = unsafe { (host.query)(context, desc) };
+    // Null-context queries (e.g. GET_RENDER_RESOLUTION 0x10003) on PC SDKs
+    // look for a host DX12 backend and optional provider override in `pNext`.
+    let code = if context.is_null() {
+        with_null_context_query_chain(desc, host.device.as_raw(), host.provider_id, |head| {
+            // SAFETY: `head` carries our host backend/provider chain for this call.
+            unsafe { (host.query)(context, head) }
+        })
+    } else {
+        // SAFETY: context-bound query passes through unchanged.
+        unsafe { (host.query)(context, desc) }
+    };
     if kind == GET_RENDER_RESOLUTION && code != OK {
         tracing::warn!(
             code,
@@ -808,6 +883,70 @@ mod tests {
         };
         link(&mut upscale, &mut backend);
         assert_eq!(backend.header.next, &raw mut version);
+        // A console version override chained after the console backend is skipped too.
+        let mut console_override = OverrideVersion {
+            header: header(OVERRIDE_VERSION, &raw mut version),
+            id: 0xf5a5_ca1e_0100_1001,
+        };
+        let mut console_with_override = Backend {
+            header: header(CONSOLE_BACKEND, &raw mut console_override.header),
+            device: 0x1234 as *mut c_void,
+        };
+        let mut upscale = CreateUpscale {
+            header: header(CREATE_UPSCALE, &raw mut console_with_override.header),
+            ..upscale
+        };
+        link(&mut upscale, &mut backend);
+        assert_eq!(backend.header.next, &raw mut version);
+    }
+
+    /// Null-context `ffxQuery` chains the host DX12 backend and selected
+    /// provider override, skipping any console backend/override, and restores
+    /// the caller's original `pNext` on return.
+    #[test]
+    fn null_context_query_splices_host_backend_and_restores_chain() {
+        let mut tail = header(0x1_000b, null_mut());
+        let mut console_override = OverrideVersion {
+            header: header(OVERRIDE_VERSION, &raw mut tail),
+            id: 0xf5a5_ca1e_0100_1001,
+        };
+        let mut console_backend = Backend {
+            header: header(CONSOLE_BACKEND, &raw mut console_override.header),
+            device: 0x1234 as *mut c_void,
+        };
+        let mut query = header(GET_RENDER_RESOLUTION, &raw mut console_backend.header);
+        let host_dev = 0x9999 as *mut c_void;
+        let host_id = 0x4120_0000_0000_0001;
+
+        let seen = with_null_context_query_chain(&raw mut query, host_dev, host_id, |head| {
+            // SAFETY: stack nodes live for this closure.
+            unsafe {
+                let first = &*head;
+                let second = &*first.next.cast::<Backend>();
+                let third = &*second.header.next.cast::<OverrideVersion>();
+                (
+                    first.kind,
+                    second.header.kind,
+                    second.device,
+                    third.header.kind,
+                    third.id,
+                    third.header.next,
+                )
+            }
+        });
+        assert_eq!(
+            seen,
+            (
+                GET_RENDER_RESOLUTION,
+                HOST_BACKEND,
+                host_dev,
+                OVERRIDE_VERSION,
+                host_id,
+                &raw mut tail,
+            )
+        );
+        // Caller's chain must be restored untouched.
+        assert_eq!(query.next, &raw mut console_backend.header);
     }
 
     /// Without the PC build the title's own DLL serves its imports.
