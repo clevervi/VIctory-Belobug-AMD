@@ -561,11 +561,15 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    let vmem = host().and_then(|h| h.video_memory());
     if crate::residency::pressured() {
         trim_spare_chunks();
+        trim_spare_uploads();
+    }
+    if vram_is_tight(vmem) {
         trim_spare_batch_buffers();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::room(vmem);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1313,6 +1317,21 @@ unsafe impl Send for BatchBuf {}
 
 static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
 const SPARE_BATCH_MAX: usize = 64;
+const SPARE_BATCH_FLOOR: usize = 16;
+
+/// Whether local GPU VRAM usage has reached 90% of its DXGI budget.
+fn vram_is_tight(vmem: Option<[u64; 4]>) -> bool {
+    vmem.is_some_and(|[budget, usage, ..]| budget > 0 && usage.saturating_mul(10) >= budget.saturating_mul(9))
+}
+
+/// How many idle indirect-batch UAV buffers (dedicated VRAM, ~256 KiB each)
+/// to retain: driven by `keep_freed` and local VRAM tightness, never by host
+/// system-RAM pressure (shrinking this pool on 32 GiB hosts caused tens of
+/// thousands of synchronous `MakeResident` + `mapped()` stalls for ~12 MiB of
+/// VRAM while gigabytes of VRAM were free).
+fn batch_pool_limit(keep_freed: bool, vram_tight: bool) -> usize {
+    if keep_freed && !vram_tight { SPARE_BATCH_MAX } else { SPARE_BATCH_FLOOR }
+}
 
 fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
@@ -1327,7 +1346,7 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     if buffers.is_empty() {
         return;
     }
-    let limit = if keep_freed() && !crate::residency::pressured() { SPARE_BATCH_MAX } else { 16 };
+    let limit = batch_pool_limit(keep_freed(), false);
     let mut overflow = Vec::new();
     {
         let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -1345,10 +1364,11 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
 fn trim_spare_batch_buffers() {
     let freed: Vec<BatchBuf> = {
         let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.is_empty() {
+        if spare.len() <= SPARE_BATCH_FLOOR {
             return;
         }
-        std::mem::take(&mut *spare)
+        let drop_n = spare.len() - SPARE_BATCH_FLOOR;
+        spare.drain(..drop_n).collect()
     };
     drop(freed);
 }
@@ -2053,6 +2073,10 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
+/// Working-set floor kept when trimming idle scratch chunks under host RAM
+/// pressure: releases peaks above 32 MiB without emptying the pool to 0 every
+/// second (which caused thousands of upload buffer alloc/zero/free cycles).
+const SPARE_PRESSURED: u64 = 32 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
@@ -2097,6 +2121,24 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+
+    /// Drops the oldest kept items until at most `max_bytes` remain, returning
+    /// the dropped entries so callers can drop resources outside the lock.
+    fn trim_to(&mut self, max_bytes: u64) -> Vec<(T, u64)> {
+        if self.bytes <= max_bytes {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        let mut keep_from = 0;
+        while keep_from < self.kept.len() && self.bytes > max_bytes {
+            self.bytes -= self.kept[keep_from].1;
+            keep_from += 1;
+        }
+        if keep_from > 0 {
+            dropped.extend(self.kept.drain(..keep_from));
+        }
+        dropped
     }
 }
 
@@ -2157,23 +2199,104 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
+/// Lets go of idle scratch chunks above [`SPARE_PRESSURED`] when the system is
+/// short of memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
-        }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        spare.trim_to(SPARE_PRESSURED)
     };
+    if freed.is_empty() {
+        return;
+    }
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    drop(freed);
+}
+
+/// Pooled mapped staging buffer for [`HostList::upload`] (`CopyTextureRegion`
+/// from buffer and `texture::zeros`): avoids creating a fresh resident/mapped
+/// `shared_buffer` (which triggers synchronous `mapped()` waits) on every copy.
+struct UploadBuf {
+    buffer: ID3D12Resource,
+    data: usize,
+    shared: bool,
+}
+
+// SAFETY: `ID3D12Resource` is free-threaded and `data` stays mapped for the
+// lifetime of `buffer`; entries only enter `SPARE_UPLOADS` when `references == 1`.
+unsafe impl Send for UploadBuf {}
+
+const UPLOAD_POOL_MIN: u64 = 64 << 10;
+const UPLOAD_POOL_MAX_ITEM: u64 = 4 << 20;
+const UPLOAD_POOL_PRESSURED: u64 = 16 << 20;
+
+fn upload_pool_bucket(size: u64) -> Option<u64> {
+    if size == 0 || size > UPLOAD_POOL_MAX_ITEM {
+        return None;
+    }
+    Some(size.max(UPLOAD_POOL_MIN).next_power_of_two())
+}
+
+fn upload_pool_limit(limited_ram: bool) -> u64 {
+    if limited_ram { 32 << 20 } else { 64 << 20 }
+}
+
+static SPARE_UPLOADS: Mutex<Spare<UploadBuf>> = Mutex::new(Spare::new());
+
+fn take_upload(host: &Host, size: u64, shared: bool) -> Option<(UploadBuf, u64, bool)> {
+    let Some(cap) = upload_pool_bucket(size) else {
+        let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        name(&buffer, || format!("list upload {size:#x}"));
+        return Some((UploadBuf { buffer, data: data as usize, shared }, size, false));
+    };
+    {
+        let mut spare = SPARE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = spare.kept.iter().rposition(|(u, s)| *s == cap && u.shared == shared) {
+            let (buf, _) = spare.kept.remove(at);
+            spare.bytes -= cap;
+            return Some((buf, cap, true));
+        }
+    }
+    let (buffer, data) = if shared { host.shared_buffer(cap)? } else { host.upload_buffer(cap)? };
+    name(&buffer, || format!("list upload pool {cap:#x}"));
+    Some((UploadBuf { buffer, data: data as usize, shared }, cap, true))
+}
+
+fn give_uploads(buffers: Vec<(UploadBuf, u64)>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let limit = if crate::residency::pressured() {
+        UPLOAD_POOL_PRESSURED
+    } else {
+        upload_pool_limit(crate::residency::limited_host_ram())
+    };
+    let mut freed = Vec::new();
+    {
+        let mut spare = SPARE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        for (buf, cap) in buffers {
+            if references(&buf.buffer) == 1 {
+                if let Some(overflow) = spare.give(buf, cap, limit) {
+                    freed.push(overflow);
+                }
+            } else {
+                freed.push(buf);
+            }
+        }
+    }
+    drop(freed);
+}
+
+fn trim_spare_uploads() {
+    let freed = {
+        let mut spare = SPARE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        spare.trim_to(UPLOAD_POOL_PRESSURED)
+    };
     drop(freed);
 }
 
@@ -2452,7 +2575,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
+    /// Pooled upload/shared staging buffers returned to [`SPARE_UPLOADS`] on drop.
+    pooled_uploads: Vec<(UploadBuf, u64)>,
+    /// The bytes of `uploads` and `pooled_uploads` (counted in [`ALIVE`] while held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -2507,6 +2632,15 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// Holds a poolable upload/shared buffer until the list is reset, returning
+    /// it to [`SPARE_UPLOADS`] when dropped if no other reference remains.
+    fn hold_pooled_upload(&mut self, buffer: UploadBuf, cap: u64) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(cap, Ordering::Relaxed);
+        self.upload_bytes += cap;
+        self.pooled_uploads.push((buffer, cap));
+    }
+
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
@@ -2518,8 +2652,16 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        let count = (self.uploads.len() + self.pooled_uploads.len()) as u64;
+        ALIVE[6].fetch_sub(count, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        if !self.pooled_uploads.is_empty() {
+            // Drop any step/kept clones first so `references == 1` holds for
+            // buffers that are no longer referenced anywhere else.
+            self.copies.clear();
+            self.kept.clear();
+            give_uploads(std::mem::take(&mut self.pooled_uploads));
+        }
     }
 }
 
@@ -7359,15 +7501,18 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset (pooled up to 4 MiB in [`SPARE_UPLOADS`]).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        let shared = card_steps::stage() > 1;
+        let (buf, cap, pooled) = take_upload(host, size, shared)?;
+        let out = (buf.buffer.clone(), buf.data as *mut u8);
+        if pooled {
+            self.deferred().hold_pooled_upload(buf, cap);
+        } else {
+            self.deferred().hold_upload(buf.buffer, cap);
+        }
+        Some(out)
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -10723,6 +10868,43 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    #[test]
+    fn spare_trim_to_drops_oldest_and_keeps_working_set() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, 4, 20), None);
+        assert_eq!(spare.give(2, 4, 20), None);
+        assert_eq!(spare.give(3, 4, 20), None);
+        assert_eq!(spare.give(4, 4, 20), None);
+        // Trimming to 8 drops the two oldest (1, 2) and preserves the newest (3, 4).
+        let dropped = spare.trim_to(8);
+        assert_eq!(dropped, vec![(1, 4), (2, 4)]);
+        assert_eq!(spare.bytes, 8);
+        assert_eq!(spare.take(4), Some(4));
+        assert_eq!(spare.take(4), Some(3));
+        assert_eq!(spare.take(4), None);
+        assert_eq!(spare.bytes, 0);
+    }
+
+    #[test]
+    fn batch_pool_and_upload_pool_limits_are_sane() {
+        use super::{
+            SPARE_BATCH_FLOOR, SPARE_BATCH_MAX, UPLOAD_POOL_MAX_ITEM, UPLOAD_POOL_MIN,
+            batch_pool_limit, upload_pool_bucket, upload_pool_limit, vram_is_tight,
+        };
+        assert_eq!(batch_pool_limit(true, false), SPARE_BATCH_MAX);
+        assert_eq!(batch_pool_limit(true, true), SPARE_BATCH_FLOOR);
+        assert_eq!(batch_pool_limit(false, false), SPARE_BATCH_FLOOR);
+        assert!(!vram_is_tight(None));
+        assert!(!vram_is_tight(Some([15_407, 9_307, 15_451, 6_732])));
+        assert!(vram_is_tight(Some([10_000, 9_000, 10_000, 0])));
+        assert_eq!(upload_pool_bucket(0), None);
+        assert_eq!(upload_pool_bucket(256), Some(UPLOAD_POOL_MIN));
+        assert_eq!(upload_pool_bucket(UPLOAD_POOL_MIN + 1), Some(UPLOAD_POOL_MIN * 2));
+        assert_eq!(upload_pool_bucket(UPLOAD_POOL_MAX_ITEM), Some(UPLOAD_POOL_MAX_ITEM));
+        assert_eq!(upload_pool_bucket(UPLOAD_POOL_MAX_ITEM + 1), None);
+        assert!(upload_pool_limit(true) < upload_pool_limit(false));
     }
 }
 
