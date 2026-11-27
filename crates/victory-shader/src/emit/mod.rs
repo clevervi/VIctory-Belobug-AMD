@@ -2471,10 +2471,11 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
+        // With `twins = 0` (capped view heap, e.g. NVIDIA), port 5 reads the raw view directly at slot 0.
         const TWINS: u32 = 2;
-        let lowered = |raw: bool| {
+        let lowered = |raw: bool, twins: u32| {
             super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
-            super::shader::RAW_VIEWS_HERE.set(Some(if raw { TWINS } else { 0 }));
+            super::shader::RAW_VIEWS_HERE.set(Some(twins));
             let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
@@ -2495,14 +2496,15 @@ mod tests {
             super::shader::RAW_VIEWS_HERE.set(None);
             l
         };
-        let (before, after) = (lowered(false), lowered(true));
-        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        let (before, after_twins, after_direct) = (lowered(false, 0), lowered(true, TWINS), lowered(true, 0));
+        assert_ne!(before.dxil, after_twins.dxil, "the switch changes the translation (twins)");
+        assert_ne!(before.dxil, after_direct.dxil, "the switch changes the translation (capped heap)");
         let data: Vec<u32> = (0..16u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
         let other: Vec<u32> = vec![0xdead_beef; 64];
         let s0 = 8u32;
         let want: Vec<u32> = vec![data[4], data[5], data[6], data[7], data[(s0 / 4) as usize]];
         let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        for (raw, l) in [(false, before), (true, after)] {
+        for (raw, twins, l) in [(false, 0, before), (true, TWINS, after_twins), (true, 0, after_direct)] {
             let mut dxil = l.dxil;
             if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
                 v.validate(&mut dxil).unwrap();
@@ -2524,10 +2526,15 @@ mod tests {
                 half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
-            let views: Vec<super::host::View> = if raw {
+            let views: Vec<super::host::View> = if raw && twins != 0 {
                 vec![
                     super::host::View::Cbv(&other),
                     super::host::View::RawUav(8),
+                    super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                    super::host::View::RawUav(8),
+                ]
+            } else if raw {
+                vec![
                     super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
                     super::host::View::RawUav(8),
                 ]
@@ -2546,9 +2553,9 @@ mod tests {
                     },
                 )
                 .unwrap();
-            // The UAV is written where the program reads it: its twin with the switch.
+            // The UAV is written where the program reads it: its twin with twins, slot 1 otherwise.
             let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
-            assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
+            assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw} twins {twins}: {out:x?}");
         }
     }
 

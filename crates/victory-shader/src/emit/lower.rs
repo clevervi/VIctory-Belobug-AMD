@@ -7197,9 +7197,10 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            // (Renderer port 5: the twin of a constant buffer's slot is a
-            // raw view of its bytes, read as one.)
-            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            // (Renderer port 5: a constant buffer's slot—or its raw twin when
+            // the host heap has twins—holds a raw view of its bytes, read as
+            // one.)
+            let as_raw = super::shader::constants_raw();
             let h = if as_raw {
                 self.handle(site, src, false, (11, 0))?
             } else {
@@ -7790,9 +7791,10 @@ impl<'a> Lower<'a> {
     /// view starts on 16 bytes and a root SRV anywhere on 4, so read so the
     /// card can take the title's bytes where they are:
     /// - a table's (or one picked from the view heap): through the raw twin
-    ///   of its slot ([`super::shader::raw_views`]), which the host makes a
-    ///   raw view of the same bytes; a twin's reads end where the view does,
-    ///   as a constant buffer's do;
+    ///   of its slot ([`super::shader::raw_views`]) when the host has twins,
+    ///   or directly through the slot itself on a capped view heap
+    ///   (`raw_views() == 0`, e.g. NVIDIA) where the host places the raw view
+    ///   in the slot; reads end where the view does, as a constant buffer's do;
     /// - a root one: as the root SRV `t<slot>` in [`super::shader::ROOT_CBV_SPACE`],
     ///   which the host binds at the title's address like any root SRV.
     ///
@@ -7815,9 +7817,6 @@ impl<'a> Lower<'a> {
             }
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
-            return Ok(None);
-        }
         let x = self.x;
         let scalar = &self.scalar;
         let through_heap = src.leaves().iter().all(|leaf| match leaf {
@@ -7830,7 +7829,8 @@ impl<'a> Lower<'a> {
         if !through_heap {
             return Ok(None);
         }
-        // (Raw, so `raw_twin` gives the twin's index.)
+        // (Raw, so `raw_twin` gives the twin's index when twins exist, or the
+        // slot itself when `raw_views() == 0`.)
         Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
