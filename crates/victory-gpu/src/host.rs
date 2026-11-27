@@ -3417,6 +3417,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
         return false;
     }
     line.line.push(Late::Signal(fence, value));
+    crate::fence_lag::queued(fence, value);
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -3815,6 +3816,7 @@ impl RelayBack {
         land::spent(land::stat::BACK, merging);
         for ((_, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            crate::fence_lag::copied(written);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
@@ -4185,6 +4187,7 @@ fn hand_back(back: &[Declared]) {
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::fence_lag::copied(written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
@@ -4217,6 +4220,7 @@ fn hand_back(back: &[Declared]) {
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::fence_lag::copied(written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
         }
@@ -5131,6 +5135,7 @@ impl Host {
         }
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+        crate::fence_lag::copied(written);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);
@@ -5154,6 +5159,8 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // VICTORY_FENCE_LAG: the card was seen done with these flights now.
+        let copied_before = crate::fence_lag::copied_so_far();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5241,6 +5248,7 @@ impl Host {
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    crate::fence_lag::set(fence, value, landing, crate::fence_lag::copied_so_far() - copied_before);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5419,6 +5427,7 @@ impl Host {
         }
         for (r, written) in plan.ranges.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::fence_lag::copied(written as u64);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
@@ -5616,6 +5625,9 @@ impl Host {
                 LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
             }
             LATE_STATS[11].fetch_add(flights as u64, Ordering::Relaxed);
+            // VICTORY_FENCE_LAG: when the card was seen done, what was copied back.
+            let mut card_done = std::time::Instant::now();
+            let copied_before = crate::fence_lag::copied_so_far();
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
@@ -5635,6 +5647,7 @@ impl Host {
                     }
                 }
                 let gpu = waiting.elapsed();
+                card_done = std::time::Instant::now();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5705,7 +5718,10 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => {
+                        crate::fence::set(fence as crate::object::This, value);
+                        crate::fence_lag::set(fence, value, card_done, crate::fence_lag::copied_so_far() - copied_before);
+                    }
                 }
             }
             if last > 0 {

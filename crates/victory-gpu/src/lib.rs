@@ -61,6 +61,8 @@ pub mod port_descriptors;
 mod port_journal;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod fence_lag;
 pub mod list;
 pub mod object;
 #[cfg(windows)]
