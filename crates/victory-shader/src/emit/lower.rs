@@ -342,6 +342,9 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// With `split_lds`: what the host waves' LDS looks like since the last meeting in this IR
+    /// block ([`LdsSeen`]), so that accesses that cannot race get no barrier of their own.
+    lds_seen: LdsSeen,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -1231,6 +1234,73 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// What the two host waves of a console wave have done to LDS since they last met, in one IR
+/// block (a console wave run as two host waves, `Lower::split_lds`). The console runs the
+/// wave's lanes in step, so a write is seen by every later access and a read is done before
+/// every later write; two host waves keep that order if they meet between two accesses of which
+/// one writes. Two reads need no meeting between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LdsSeen {
+    /// Nothing is known (the start of a block): the first access asks for a meeting.
+    Unknown,
+    /// They just met and nothing was accessed since.
+    Met,
+    /// Only reads since they met.
+    Reads,
+    /// A write since they met.
+    Wrote,
+}
+
+impl LdsSeen {
+    /// Whether an access (`write`: not a read) needs the host waves to meet first, and what is
+    /// known after it.
+    fn access(self, write: bool) -> (bool, LdsSeen) {
+        let meet = match self {
+            LdsSeen::Unknown | LdsSeen::Wrote => true,
+            LdsSeen::Reads => write,
+            LdsSeen::Met => false,
+        };
+        (meet, if write { LdsSeen::Wrote } else { LdsSeen::Reads })
+    }
+}
+
+#[cfg(test)]
+mod lds_seen_tests {
+    use super::LdsSeen;
+
+    /// Runs `accesses` (true: a write) from `start`: how many meetings they ask for.
+    fn meetings(start: LdsSeen, accesses: &[bool]) -> usize {
+        let mut seen = start;
+        let mut meetings = 0;
+        for &write in accesses {
+            let (meet, next) = seen.access(write);
+            meetings += usize::from(meet);
+            seen = next;
+        }
+        meetings
+    }
+
+    #[test]
+    fn reads_in_a_row_meet_once() {
+        assert_eq!(meetings(LdsSeen::Unknown, &[false, false, false, false]), 1);
+        assert_eq!(meetings(LdsSeen::Met, &[false, false, false]), 0);
+    }
+
+    #[test]
+    fn a_write_meets_every_access_around_it() {
+        // read, write: meet before the write (it must not overwrite what the other half reads)
+        assert_eq!(meetings(LdsSeen::Met, &[false, true]), 1);
+        // write, read: meet before the read (it must see what the other half wrote)
+        assert_eq!(meetings(LdsSeen::Met, &[true, false]), 1);
+        // write, write: the same words may be written from both halves
+        assert_eq!(meetings(LdsSeen::Met, &[true, true]), 1);
+        // as before, every access of an unknown start meets
+        assert_eq!(meetings(LdsSeen::Unknown, &[true, true, true]), 3);
+        // read, write, read, read: meets before the write and the read after it
+        assert_eq!(meetings(LdsSeen::Unknown, &[false, true, false, false]), 3);
+    }
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -2081,7 +2151,7 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += 4 * group.div_ceil(64);
                             }
                         }
                     }
@@ -2281,6 +2351,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_seen: LdsSeen::Unknown,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -2789,8 +2860,7 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let ((lo0, lo1), (hi0, hi1)) = self.exchange_halves_pair(self.cur, r_lo, r_hi);
             let c = self.cur;
             let d0 = self
                 .s
@@ -3011,6 +3081,10 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            // Nothing is known of LDS at a block that predecessors can reach,
+            // except when an entry meeting runs right here; an entry block with
+            // no predecessors starts clean.
+            self.lds_seen = if p.blocks[b].preds.is_empty() { LdsSeen::Met } else { LdsSeen::Unknown };
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -4970,6 +5044,9 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        if block == self.cur {
+            self.lds_seen = LdsSeen::Met;
+        }
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -5013,8 +5090,53 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
-    /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// [`Self::exchange_halves`] of two values at once: both are stored, the halves meet once,
+    /// both are read, and the halves meet again (two group barriers where two exchanges take
+    /// four). The second value goes through the second pair of the console wave's four dwords
+    /// ([`Self::exchange_pair`]). Where nothing is exchanged through LDS (a group of 32 or
+    /// fewer, or each host wave on its own) there are no barriers either way.
+    fn exchange_halves_pair(&mut self, at: usize, first: V, second: V) -> ((V, V), (V, V)) {
+        let small = self.exchange.as_ref().is_some_and(|e| e.1);
+        if self.exchange.is_none() || small || self.local {
+            let a = self.exchange_halves(at, first);
+            let b = self.exchange_halves(at, second);
+            return (a, b);
+        }
+        let Some(slot) = self.exchange.as_ref().map(|e| e.0) else {
+            let a = self.exchange_halves(at, first);
+            let b = self.exchange_halves(at, second);
+            return (a, b);
+        };
+        let pair = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let lds = self.s.lds();
+        let (one, two) = (self.s.m.i32(1), self.s.m.i32(2));
+        let pair_b = self.s.m.bin(at, Bin::Add, pair, two);
+        let index_a = self.s.m.bin(at, Bin::Add, pair, half);
+        let index_b = self.s.m.bin(at, Bin::Add, pair_b, half);
+        let ptr_a = self.s.m.element(at, lds, index_a);
+        let ptr_b = self.s.m.element(at, lds, index_b);
+        self.s.m.store(at, ptr_a, first);
+        self.s.m.store(at, ptr_b, second);
+        self.group_sync(at);
+        let a1 = self.s.m.bin(at, Bin::Add, pair, one);
+        let b1 = self.s.m.bin(at, Bin::Add, pair_b, one);
+        let pa0 = self.s.m.element(at, lds, pair);
+        let pa1 = self.s.m.element(at, lds, a1);
+        let pb0 = self.s.m.element(at, lds, pair_b);
+        let pb1 = self.s.m.element(at, lds, b1);
+        let (alo, ahi) = (self.s.m.load(at, pa0), self.s.m.load(at, pa1));
+        let (blo, bhi) = (self.s.m.load(at, pb0), self.s.m.load(at, pb1));
+        // the slots are written again only after every thread read them
+        self.group_sync(at);
+        ((alo, ahi), (blo, bhi))
+    }
+
+    /// The first of the four exchange dwords of this thread's console wave (made in the entry
+    /// block): a group of several console waves has four for each (a pair per value of
+    /// [`Self::exchange_halves_pair`]; a single exchange uses the first pair).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -5023,7 +5145,7 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
+        let one = self.s.m.i32(2);
         let twice = self.s.m.bin(e, Bin::Shl, wave, one);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
@@ -6175,11 +6297,15 @@ impl<'a> Lower<'a> {
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // the two host waves of a console wave meet before each LDS access that could race
+            // with one before it: what the other half wrote is visible, and what it still reads
+            // is not overwritten (two reads in a row, or an access right after a meeting, do not)
+            let write = !name.starts_with("ds_read");
+            let (meet, seen) = self.lds_seen.access(write);
+            if meet {
+                self.group_sync(self.cur);
+            }
+            self.lds_seen = seen;
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -6214,6 +6340,9 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                if waits {
+                    self.lds_seen = LdsSeen::Met;
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -6261,6 +6390,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        self.lds_seen = LdsSeen::Met;
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -9825,8 +9955,7 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let ((lo_has, hi_has), (lo, hi)) = self.exchange_halves_pair(c, has, mine);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);

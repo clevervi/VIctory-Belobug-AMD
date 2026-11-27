@@ -22,6 +22,7 @@ param(
     [switch]$NoPorts,
     [ValidateSet('off', 'last', '1')][string]$WaveWide = 'last',
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [switch]$Overlay,
     [string]$Keys = '25:Enter,33:X,41:Enter,49:X,57:Enter',
@@ -113,8 +114,9 @@ $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = 'auto'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'
 }
+if ($Build -eq 'diag') { $settings.VICTORY_D3D12_DRED = 'light' }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
@@ -125,6 +127,7 @@ if (-not $NoPorts -and -not $Safe) {
     $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1'; $settings.VICTORY_SETTLE_ROOM = '1'
 }
 if ($WaveWide -ne 'off') { $settings.VICTORY_WAVE_WIDE = $WaveWide }
+if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Overlay) { $settings.VICTORY_OVERLAY = 'show' }
 if (-not $Interactive -and $Keys) { $settings.VICTORY_KEYS = $Keys }
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }
@@ -287,7 +290,7 @@ $resLine     = ($cleanErr | Select-String 'enabling VICTORY_RESIDENCY' | Select-
 $awakeLine   = ($cleanErr | Select-String 'VICTORY_CARD_AWAKE' | Select-Object -First 1).Line
 $port2Lines  = @($cleanErr | Select-String 'renderer port 2:.*patched')
 
-$refusedLines = @($cleanErr | Select-String -Pattern 'refused|CreateComputePipelineState failed|CreateGraphicsPipelineState failed')
+$refusedLines = @($cleanErr | Select-String -Pattern 'pipeline.*refused|refused.*pipeline|CreateComputePipelineState failed|CreateGraphicsPipelineState failed')
 $deviceLost   = @($cleanErr | Select-String -Pattern 'device lost|DXGI_ERROR_DEVICE_REMOVED|DXGI_ERROR_DEVICE_HUNG|panic')
 $pressureHits = @($cleanErr | Select-String -Pattern 'host memory pressure:')
 $errorLines   = @($cleanErr | Select-String -Pattern '\sERROR\s')
