@@ -58,6 +58,8 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let fsr = fsr_4k::FsrPreset::requested()?;
+    victory_hle::modules::controls::configure(cfg.controls.as_ref())
+        .map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
