@@ -392,6 +392,7 @@ impl Overlay {
     /// records its copy into `back` (`width` x `height` of `format`, in
     /// `state`) on `list`, moving `back` to the copy destination state
     /// first. Returns the state `back` is left in.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &mut self,
         host: &Host,

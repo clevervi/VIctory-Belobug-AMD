@@ -641,7 +641,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             if src.is_none()
                 && patches_sse4a()
                 // SAFETY: `rip` is the faulting instruction in title code.
-                && unsafe { patch_sse4a(rip, &code, len, what) }
+                && unsafe { patch_sse4a(rip, code, len, what) }
             {
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
@@ -663,7 +663,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             if !reg
                 && patches_sse4a()
                 // SAFETY: `rip` is the faulting instruction in title code.
-                && unsafe { patch_sse4a(rip, &code, len, what) }
+                && unsafe { patch_sse4a(rip, code, len, what) }
             {
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
