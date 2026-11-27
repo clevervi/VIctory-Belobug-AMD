@@ -31,9 +31,35 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 /// Least bytes of the smaller levels a key is made of.
 pub(crate) const MIN_PREFIX: u64 = 32 << 10;
-/// Bytes of levels kept in memory at most (the rest is read from the folder
-/// when asked).
-const KEPT: u64 = 4 << 30;
+/// Bytes of levels kept in memory at most, read once (the rest is read from
+/// the folder each time it is asked for): [`kept_budget`] of
+/// `VICTORY_TEXTURE_STORE_KEPT_MB` and of whether this is a PC with little
+/// memory (`residency::limited_host_ram`: 32 GB or less, with the memory
+/// guard on, as it is there unless `VICTORY_RESIDENCY=0`).
+fn kept_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let text = std::env::var("VICTORY_TEXTURE_STORE_KEPT_MB").ok();
+        let asked = text.as_deref().and_then(|v| v.trim().parse().ok());
+        if asked.is_none() && let Some(text) = &text {
+            tracing::warn!(value = %text, "VICTORY_TEXTURE_STORE_KEPT_MB is not a number of megabytes: left out");
+        }
+        let most = kept_budget(asked, crate::residency::limited_host_ram());
+        tracing::info!(mb = most >> 20, "texture store: levels kept in memory at most");
+        most
+    })
+}
+
+/// `asked_mb` if set, else 4 GiB, or 512 MiB on a PC with little memory
+/// (`limited`): on a 32 GB laptop the title leaves 1-2 GB free in the
+/// world, and memory kept is never let go.
+fn kept_budget(asked_mb: Option<u64>, limited: bool) -> u64 {
+    match asked_mb {
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None if limited => 512 << 20,
+        None => 4 << 30,
+    }
+}
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -225,7 +251,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_most() {
         store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
         store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
@@ -250,7 +276,7 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_most() {
                 store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
                 store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
             }
@@ -281,6 +307,18 @@ pub(crate) static PREFILLED: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_kept_fits_the_pc() {
+        // A PC with 32 GB or less keeps 512 MiB in memory; the rest is read from the folder.
+        assert_eq!(kept_budget(None, true), 512 << 20);
+        assert_eq!(kept_budget(None, false), 4 << 30);
+        // `VICTORY_TEXTURE_STORE_KEPT_MB` wins either way; 0 keeps nothing in memory.
+        assert_eq!(kept_budget(Some(1024), true), 1 << 30);
+        assert_eq!(kept_budget(Some(0), false), 0);
+        // A number too big for bytes means no limit, not a wrapped one.
+        assert_eq!(kept_budget(Some(u64::MAX), true), u64::MAX);
+    }
 
     #[test]
     fn index_lines_read_back() {
