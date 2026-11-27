@@ -2426,7 +2426,7 @@ impl State {
     /// shortcut: uploaded once, and again only when the title rewrites the
     /// slot. A placed texture not all mapped yet is uploaded with what is
     /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
+    /// four seconds, `look_frames`): uploaded again when more of it is mapped. Pages mapped
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
@@ -2518,22 +2518,13 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
-        static PASSED: AtomicU64 = AtomicU64::new(0);
-        let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        // (`took` is since the last pass, of any heap and list: several a
-        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
-        // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
-        let most = match look_ms() {
-            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
-            None => (4000 / took).clamp(16, 256),
-        };
+        // How long a slot with nothing to upload waits at most for its next
+        // look (`look_frames`). In frames alone it was 120: four minutes at
+        // the opening cutscene's half a frame per second, while the title
+        // streams by the clock. (About a second before the runtime told of
+        // the memory it maps: the looks are now only for what that does not
+        // tell.)
+        let most = look_frames(look_ms(), frame_ms(frame, crate::host::now_ms()));
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -4910,10 +4901,25 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// The most frames between two looks at a slot whose memory is away:
+/// `look_ms` (`VICTORY_TEXTURE_LOOK_MS`, at least a frame) or about four
+/// seconds (at least 16 frames), both by `frame_time` ([`frame_ms`]). The
+/// four seconds were counted by the time since the last pass, of any heap
+/// and list, several a frame: up to 256 frames, over 30 s at the world's 7
+/// frames a second (runs tl3 and tex2, 2026-11-27: nine in ten last looks
+/// that found a slot's memory away came under 32 s before its upload).
+fn look_frames(look_ms: Option<u64>, frame_time: u64) -> u64 {
+    let frame_time = frame_time.max(1);
+    match look_ms {
+        Some(ms) => (ms / frame_time).clamp(1, 256),
+        None => (4000 / frame_time).clamp(16, 256),
+    }
+}
+
 /// The longest wait, in milliseconds, between two looks at a texture slot
 /// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
-/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
-/// ... frames up to it. Measured (run light-22, `crate::texlate`): from
+/// four seconds, [`look_frames`]). The looks back off 1, 2, 4, ... frames
+/// up to it. Measured (run light-22, `crate::texlate`): from
 /// the last look that found a slot's memory away to its upload, half under
 /// 0.5 s but nine in ten under 32 s: the memory had come long before.
 fn look_ms() -> Option<u64> {
@@ -4959,6 +4965,21 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    #[test]
+    fn looks_at_memory_away_wait_about_four_seconds_of_frames() {
+        use super::look_frames;
+        // The world at 7 frames a second: 28 frames between looks, not 256 (36 s).
+        assert_eq!(look_frames(None, 140), 28);
+        assert_eq!(look_frames(None, 16), 250);
+        // Half a frame a second keeps the floor of 16 frames; a fast host the ceiling.
+        assert_eq!(look_frames(None, 2000), 16);
+        assert_eq!(look_frames(None, 1), 256);
+        // `VICTORY_TEXTURE_LOOK_MS` counts the same way, down to every frame.
+        assert_eq!(look_frames(Some(500), 140), 3);
+        assert_eq!(look_frames(Some(500), 1000), 1);
+        assert_eq!(look_frames(Some(500), 0), 256);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
