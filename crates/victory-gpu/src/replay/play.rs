@@ -647,6 +647,9 @@ impl Player {
         player.check()?;
         let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
         let mut step = |what: &'static str, at: &mut Instant| {
+            if say_progress() {
+                tracing::warn!("replay: {what} made in {:.1} s", at.elapsed().as_secs_f64());
+            }
             steps.push((what, at.elapsed()));
             *at = Instant::now();
         };
@@ -767,8 +770,12 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and
+        // made not resident (0x800): the host makes such heaps resident when
+        // it uses them, a replay never does (it runs the whole frame, so every
+        // heap must be resident anyway), and the first copy of contents into
+        // one hung the card (TDR on an RTX 3080 Laptop).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -799,6 +806,7 @@ impl Player {
             self._heaps.extend(heap.map(|heap| (h.id, heap)));
         }
         let mut failed = 0;
+        let mut alone = 0;
         let mut moves: BTreeMap<String, (u32, u64)> = BTreeMap::new();
         for (index, r) in self.frame.resources.iter().enumerate() {
             let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
@@ -867,6 +875,44 @@ impl Player {
                     }
                 }
             };
+            // A buffer recorded in a heap that denies buffers (a capture made
+            // before the recorder told a reused heap address apart: a buffer
+            // of a heap renderer port 1 opened, recorded in a texture heap):
+            // made alone, in the PC's memory as that heap was. Contents come
+            // by resource.
+            const DENY_BUFFERS: i32 = 0x4;
+            let denied = |heap: u32| self.frame.heaps.iter().any(|h| h.id == heap && h.flags & DENY_BUFFERS != 0);
+            let result = match (&result, &r.place) {
+                (Err(_), Place::Placed { heap, .. }) if is_buffer && denied(*heap) => {
+                    let p = D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_CUSTOM,
+                        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                        ..Default::default()
+                    };
+                    made = None;
+                    // SAFETY: plain creation from a description the host took.
+                    let made_alone = unsafe {
+                        self.device.CreateCommittedResource(
+                            &p,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut made,
+                        )
+                    };
+                    match made_alone {
+                        Ok(()) => {
+                            alone += 1;
+                            made_alone
+                        }
+                        // (The placed creation's error is the one to tell.)
+                        Err(_) => result,
+                    }
+                }
+                _ => result,
+            };
             match (result, made) {
                 (Ok(()), Some(res)) => {
                     // SAFETY: a live resource.
@@ -887,7 +933,11 @@ impl Player {
                 }
                 (e, _) => {
                     if failed == 0 {
-                        tracing::warn!("resource {} not made: {e:?}: {r:?}", r.id);
+                        let heap = match r.place {
+                            Place::Placed { heap, .. } => self.frame.heaps.iter().find(|h| h.id == heap),
+                            _ => None,
+                        };
+                        tracing::warn!("resource {} not made: {e:?}: {r:?}; its heap: {heap:?}", r.id);
                     }
                     failed += 1;
                 }
@@ -898,6 +948,11 @@ impl Player {
         }
         if failed > 0 {
             self.note(format!("{failed} resources could not be made again"));
+        }
+        if alone > 0 {
+            self.note(format!(
+                "{alone} buffers recorded in heaps that deny buffers were made alone in the PC's memory (a capture of an older recorder)"
+            ));
         }
         if buffers != Buffers::AsRecorded {
             self.notes.push(format!(
@@ -1456,6 +1511,10 @@ impl Player {
                 .map(|&(i, at)| (&parts[i].0, parts[i].1, at))
                 .collect();
             let buffer = stagings[k].0.clone();
+            if say_progress() {
+                let bytes: u64 = list.iter().map(|&(_, len, _)| len).sum();
+                tracing::warn!(batch = n, of = batches.len(), parts = list.len(), mb = bytes >> 20, "replay: an upload batch");
+            }
             // The worker is another part of the player than `copy` uses.
             let other = Worker::new(&self.device, &self.worker.queue)?;
             let mut worker = std::mem::replace(&mut self.worker, other);
@@ -1493,6 +1552,9 @@ impl Player {
             .map(|c| (c.clone(), c.len, c.file))
             .collect();
         let missing = self.frame.contents.len() - textures.len();
+        if say_progress() {
+            tracing::warn!(early = early.len(), into = into.len(), "replay: contents: barriers to their first states");
+        }
         self.worker.run(|list| {
             // SAFETY: an open list; live resources.
             unsafe {
@@ -1505,6 +1567,9 @@ impl Player {
                 }
             }
         })?;
+        if say_progress() {
+            tracing::warn!(parts = textures.len(), "replay: contents: copies in");
+        }
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
@@ -3500,7 +3565,41 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         }
         let device = device.context("no device")?;
         let info = device.cast::<ID3D12InfoQueue>().ok();
+        // The layer's errors as they come: a run that hangs the card ends
+        // before the report that lists them (`debug_messages`).
+        if debug && let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
+            let mut cookie = 0;
+            if let Err(e) =
+                q.RegisterMessageCallback(Some(say), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie)
+            {
+                tracing::warn!("no debug-layer messages as they come: {e}");
+            }
+        }
         Ok((device, info))
+    }
+}
+
+/// `VICTORY_REPLAY_SAY=1`: each step of loading a capture, and each batch of
+/// its contents, said as it goes. A step that loses the device ends the run
+/// before the notes that time the steps are written.
+fn say_progress() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REPLAY_SAY").is_some_and(|v| v == "1"))
+}
+
+/// A debug-layer message as it comes: errors and worse, the first 64.
+unsafe extern "system" fn say(
+    _: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    text: windows::core::PCSTR,
+    _: *mut std::ffi::c_void,
+) {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+        // SAFETY: the layer's nul-terminated text, alive for the call.
+        let text = unsafe { text.to_string() }.unwrap_or_default();
+        tracing::error!(id = id.0, "debug layer: {text}");
     }
 }
 

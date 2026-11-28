@@ -75,7 +75,8 @@ with the presented one.
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
 | `--awake` | keeps the card's clocks up (`VICTORY_CARD_AWAKE=1`) |
 | `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`) |
-| `--debug-layer` | D3D12's debug layer; its errors in the report |
+| `--debug-layer` | D3D12's debug layer; its errors in the report, and each one in the log as it comes (a run that loses the device ends before the report) |
+| `VICTORY_REPLAY_SAY=1` (environment) | each step of loading the capture, and each batch of its contents, said as it goes: where a run that loses the device stopped |
 
 Use the median of several loops; the first is slower. An experiment that
 leaves out waits or work can draw another picture and, with wild data, lose

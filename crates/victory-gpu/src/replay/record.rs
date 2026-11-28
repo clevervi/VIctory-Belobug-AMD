@@ -1628,6 +1628,13 @@ unsafe extern "system" fn create_heap(
     }
 }
 
+/// Whether the heap kept as `kept` can be the live one `d` describes: its
+/// size and type, which a creation's description and the runtime's agree
+/// on (its alignment may be 0 in one and 64 KiB in the other).
+fn same_heap(kept: &wire::Heap, d: &D3D12_HEAP_DESC) -> bool {
+    kept.size == d.SizeInBytes && kept.props.kind == d.Properties.Type.0
+}
+
 fn heap_of(id: u32, d: &D3D12_HEAP_DESC) -> wire::Heap {
     wire::Heap {
         id,
@@ -1688,11 +1695,24 @@ unsafe extern "system" fn create_placed(
             this, heap, offset, desc, state, clear, iid, out,
         );
         if let Some((r, p)) = made(hr, out) {
-            // One opened from memory was not seen made.
-            let heap = r.ids.get(heap as usize).unwrap_or_else(|| {
+            // One opened from memory was not seen made. An address the map
+            // knows may also be a heap let go since, its address now another
+            // one's: a buffer placed in a heap renderer port 1 opened was
+            // recorded in a texture heap that denies buffers, and the replay
+            // refused it and hung the card. One of another size or type than
+            // the heap kept is a new one.
+            // (A same size and type at a reused address still passes: the
+            // map keeps addresses of heaps let go, as no release is hooked.)
+            let d = borrow::<ID3D12Heap>(heap).GetDesc();
+            let seen = r.ids.get(heap as usize);
+            let known = seen.filter(|id| lock(&r.heaps).get(id).is_some_and(|h| same_heap(h, &d)));
+            let heap = known.unwrap_or_else(|| {
                 let id = r.id();
-                let d = borrow::<ID3D12Heap>(heap).GetDesc();
-                r.problem("a heap opened from existing memory: a replay makes one like it");
+                r.problem(if seen.is_some() {
+                    "a heap at the address of one let go: kept as a new one"
+                } else {
+                    "a heap opened from existing memory: a replay makes one like it"
+                });
                 lock(&r.heaps).insert(id, heap_of(id, &d));
                 r.ids.set(heap as usize, id);
                 id
@@ -2733,6 +2753,22 @@ const _: () = assert!(ALL == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_heap_address_is_told_apart() {
+        let desc = |size: u64, kind: D3D12_HEAP_TYPE, alignment: u64| D3D12_HEAP_DESC {
+            SizeInBytes: size,
+            Properties: D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+            Alignment: alignment,
+            Flags: D3D12_HEAP_FLAGS(0),
+        };
+        // Kept as created (alignment 0); the runtime may say 64 KiB.
+        let kept = heap_of(7, &desc(64 << 20, D3D12_HEAP_TYPE_DEFAULT, 0));
+        assert!(same_heap(&kept, &desc(64 << 20, D3D12_HEAP_TYPE_DEFAULT, 64 << 10)));
+        // A heap opened from title memory at the address of a texture heap let go.
+        assert!(!same_heap(&kept, &desc(64 << 20, D3D12_HEAP_TYPE_CUSTOM, 64 << 10)));
+        assert!(!same_heap(&kept, &desc(1 << 20, D3D12_HEAP_TYPE_DEFAULT, 0)));
+    }
 
     #[test]
     fn when_to_record() {
